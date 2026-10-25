@@ -30,3 +30,12 @@ schema: spec-driven
 #     archive:
 #       guidance:
 #         - Summarize the archive outcome before finishing
+operations:
+  apply:
+    guidance:
+      - apply를 시작하기 전에 커밋되지 않은 계획 산출물이 있으면 구현과 분리해 커밋하도록 제안한다.
+      - 커밋은 제안만 하며, 사용자가 승인한 경우에만 수행한다.
+  archive:
+    guidance:
+      - archive를 마친 후에는 아카이브 이동과 명세 반영 내용을 커밋하도록 제안한다.
+      - 커밋은 제안만 하며, 사용자가 승인한 경우에만 수행한다.
