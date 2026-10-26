@@ -30,54 +30,75 @@
 ```
 CMakeLists.txt
 src/
-  main.cpp                    인자 해석, 시그널 설정, 서버 조립과 실행
+  apps/
+    web_server/
+      main.cpp                인자 해석, 시그널 설정, 서버 조립과 실행
   core/
     unique_fd.h               파일 디스크립터 RAII 래퍼
+    system_error.h            errno -> std::error_code
     event_loop.h/.cpp         epoll 기반 이벤트 루프
+    termination_signal_watcher.h/.cpp   signalfd 기반 종료 시그널 처리
   http/
-    http_request.h/.cpp       요청 헤더 해석
+    http_request.h/.cpp       요청 헤더 파싱
     http_response.h/.cpp      상태 코드와 응답 바이트 생성
     mime_type.h/.cpp          확장자 -> Content-Type
     static_files.h/.cpp       요청 경로 -> 웹 루트 안의 파일
     http_server.h/.cpp        리스닝 소켓과 연결별 상태 관리
 web/
   index.html, app.js
-tests/
-  *_test.cpp                  단위 테스트
-  http_server_test.sh         실행 파일 대상 통합 테스트(curl)
+tests/                        src/와 같은 디렉터리 구조
+  test_support.h              공통 검사 도구
+  core/, http/                모듈별 단위 테스트
+  integration/
+    http_server_test.sh       실행 파일 대상 통합 테스트(curl, nc)
 ```
 
-`src/` 중 `main.cpp`를 제외한 코드는 정적 라이브러리 `server_core`로 묶고, 실행 파일 `video_server`와 테스트 실행 파일이 이를 링크한다. 실행 파일 이름은 프로젝트 목표(동영상 제공 서버)를 따른다.
+실행 파일의 진입점은 `src/apps/<역할>/main.cpp`에 두고, 객체를 만들고 연결하는 일만 맡긴다. 그 밖의 `src/` 코드는 정적 라이브러리 `server_core`로 묶고, 실행 파일 `vms_web_server`와 테스트 실행 파일이 이를 링크한다. 실행 파일 이름은 `vms_<역할>` 형식을 따르며, 웹 페이지를 제공하는 이 서버는 `vms_web_server`다. 실행 파일이 늘어나도 같은 규칙으로 `src/apps/` 아래에 진입점을 추가한다.
 
 공통 컴파일 옵션은 `-fno-exceptions -Wall -Wextra -Wpedantic`이며 `CMAKE_CXX_EXTENSIONS OFF`로 C++23 표준 모드를 강제한다.
 
-### 2. 이벤트 루프: epoll, level-triggered, fd별 콜백
+### 2. 이벤트 루프: epoll, level-triggered, fd별 핸들러
 
-`EventLoop`는 fd와 콜백(`std::move_only_function<void(uint32_t events)>`)을 등록받아 `epoll_wait` 결과를 콜백으로 전달한다. 루프는 fd를 소유하지 않고, fd를 가진 객체(리스너, 연결)가 자신의 수명 동안 등록과 해제를 책임진다.
+`EventLoop`는 fd와 핸들러(`std::move_only_function<void(uint32_t events)>`)를 등록받아 `epoll_wait` 결과를 핸들러로 전달한다. 루프는 fd를 소유하지 않고, fd를 가진 객체(리스너, 연결)가 자신의 수명 동안 등록과 해제를 책임진다.
 
 - **level-triggered를 선택한 이유**: edge-triggered는 `EAGAIN`까지 반복해 읽어야 하고 빠뜨리면 연결이 멈춘다. M1의 부하에서는 성능 차이가 없으므로 실수 여지가 적은 쪽을 택한다.
 - **대안 - 연결마다 스레드**: 구현은 단순하지만 M2 이후 UDP·타이머와 상태를 공유하려면 동기화가 필요해진다. 단일 스레드 루프로 시작하면 모든 세션 상태를 락 없이 다룰 수 있다.
-- 콜백 실행 중 연결이 스스로 해제될 수 있으므로, 해제 요청은 즉시 지우지 않고 현재 `epoll_wait` 결과를 모두 처리한 뒤 정리한다.
+- 핸들러 실행 중 연결이 스스로 해제될 수 있으므로, 해제 요청은 즉시 지우지 않고 현재 `epoll_wait` 결과를 모두 처리한 뒤 정리한다.
 
 ### 3. 시그널 처리: signalfd를 이벤트 루프에 등록
 
-시작 시 `SIGINT`, `SIGTERM`을 `sigprocmask`로 막고 `signalfd`를 루프에 등록한다. 시그널이 오면 일반 이벤트처럼 콜백에서 루프 종료 플래그를 세운다.
+시작 시 `SIGINT`, `SIGTERM`을 `sigprocmask`로 막고 `signalfd`를 루프에 등록한다. 시그널이 오면 일반 이벤트처럼 핸들러에서 루프 종료 플래그를 세운다.
 
 - **대안 - `sigaction` 핸들러**: 핸들러 안에서는 async-signal-safe 함수만 쓸 수 있어 `volatile sig_atomic_t` 플래그와 `epoll_wait`의 `EINTR` 처리를 따로 맞춰야 한다. signalfd는 이 경계를 없애 종료 흐름을 다른 이벤트와 같은 경로로 처리한다.
 
 ### 4. 연결 상태 머신과 응답 버퍼
 
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> kReceivingRequest: accept 후 EPOLLIN으로 등록
+
+    kReceivingRequest --> kReceivingRequest: 헤더 끝 미도착 (다음 EPOLLIN 대기)
+    kReceivingRequest --> kSendingResponse: 헤더 완성 또는 오류 판정 (응답 준비, EPOLLOUT으로 변경)
+    kReceivingRequest --> Closed: 피어가 먼저 종료 / 읽기 오류 / 감시 변경 실패
+
+    kSendingResponse --> kSendingResponse: 일부만 송신 (다음 EPOLLOUT 대기)
+    kSendingResponse --> Closed: 응답 전부 송신 / 송신 오류
+
+    Closed --> [*]: 루프 등록 해제 후 소켓 닫기
+
+    note right of kReceivingRequest
+        received 버퍼에 누적
+        8 KiB 초과 시 400 판정
+    end note
+    note right of kSendingResponse
+        response 버퍼와 sent_size로
+        보낸 위치를 이어 감
+    end note
 ```
- accept
-   |
-   v
-+------------------+  "\r\n\r\n" 수신   +--------------------+  전부 송신   +--------+
-| ReadingRequest   | -----------------> | WritingResponse    | ----------> | Closed |
-| (EPOLLIN 감시)   |  또는 오류 판정     | (EPOLLOUT 감시)    |             +--------+
-+------------------+                    +--------------------+
-   |  피어가 먼저 종료 / 읽기 오류                                  ^
-   +----------------------------------------------------------------+
-```
+
+`kReceivingRequest`, `kSendingResponse`는 `HttpServer::Connection::State`의 값이고, `Closed`는 상태 값이 아니라 연결 객체가 제거되는 시점이다.
 
 응답은 헤더와 파일 내용을 하나의 버퍼로 만들어 두고, 쓸 수 있을 때마다 남은 부분을 `send`한다. 정적 파일은 수 KiB 규모의 페이지와 스크립트뿐이고 동영상은 HTTP가 아니라 RTP로 전달되므로, 파일 전체를 메모리로 읽는 단순한 방식으로 충분하다. 송신에는 `MSG_NOSIGNAL`을 사용해 끊긴 연결에 쓸 때 `SIGPIPE`로 종료되지 않게 한다.
 
@@ -94,6 +115,7 @@ tests/
 1. 쿼리 문자열을 제거하고, 대상이 `/`로 시작하지 않으면 `400`, `/`이면 `/index.html`로 바꾼다.
 2. `/`로 나눈 구성 요소 중 `..`이 있으면 `403`으로 거절한다.
 3. 웹 루트와 결합한 경로가 일반 파일이 아니거나 존재하지 않으면 `404`.
+4. 파일을 읽지 못하면 `500`. 경로 확인과 읽기 사이에 파일이 지워졌거나 읽기 권한이 없는 경우다.
 
 웹 루트 안에 심볼릭 링크가 없다고 가정하고, 링크를 따라간 실제 위치는 검사하지 않는다.
 
@@ -114,7 +136,7 @@ tests/
 ### 9. 테스트
 
 - **단위 테스트**: 요청 해석, 경로 해석, MIME 판정, 응답 생성. 외부 프레임워크 없이 CTest에 등록한 테스트 실행 파일로 작성하고, 실패 시 메시지를 출력하고 0이 아닌 코드로 끝낸다.
-- **통합 테스트**: 셸 스크립트가 임시 웹 루트와 빈 포트로 `video_server`를 띄우고 `curl`로 명세의 시나리오(200/400/403/404/405, 헤더)를 확인한 뒤 `SIGTERM`으로 종료 코드 0을 검증한다. 형식이 잘못된 요청은 `curl` 대신 `nc`로 보낸다.
+- **통합 테스트**: 셸 스크립트가 임시 웹 루트와 고정 포트(기본 18080, `HTTP_SERVER_TEST_PORT`로 변경 가능)로 `vms_web_server`를 띄우고 `curl`로 명세의 시나리오(200/400/403/404/405/500, 헤더)를 확인한 뒤 `SIGTERM`으로 종료 코드 0을 검증한다. 형식이 잘못된 요청은 `curl` 대신 `nc`로 보낸다. 빈 포트를 자동으로 찾으려면 외부 도구가 필요하거나 서버가 실제로 바인드한 포트를 알려 줘야 하므로, 고정 포트와 환경 변수로 충돌을 피하는 단순한 방식을 택한다.
 - **대안 - GoogleTest**: `-fno-exceptions`에서도 쓸 수 있지만 첫 단계에서 외부 의존성과 다운로드를 늘린다. 테스트가 많아지면 그때 도입을 검토한다.
 - **수동 확인**: Windows 브라우저에서 `http://localhost:8080/` 접속.
 
@@ -133,7 +155,7 @@ tests/
 
 | 예상되는 필요 | 대응하는 결정 | 추가 시 작업 |
 |---|---|---|
-| TCP(HTTP), UDP(ICE/DTLS/RTP), 타이머를 한 프로세스에서 처리 | 2장 fd 콜백 방식 이벤트 루프 | UDP 소켓과 `timerfd`를 루프에 등록 |
+| TCP(HTTP), UDP(ICE/DTLS/RTP), 타이머를 한 프로세스에서 처리 | 2장 fd 핸들러 방식 이벤트 루프 | UDP 소켓과 `timerfd`를 루프에 등록 |
 | 시그널링, 패킷 수신, 타이머가 같은 세션 상태를 갱신 | 2장 단일 스레드 루프 | 락 없이 세션 객체에 직접 접근 |
 | 여러 코어 활용 | 세션은 자기 루프 밖의 상태에 접근하지 않음 | 루프를 코어 수만큼 두고 세션을 루프에 고정 배정, 루프별 UDP 포트 사용 |
 | 시그널링 `POST` 엔드포인트 | 5장 파서와 라우팅 분리 | 라우팅에 엔드포인트 추가, `Content-Length` 기반 본문 수신, lingering close |

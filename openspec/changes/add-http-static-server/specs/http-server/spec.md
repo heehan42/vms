@@ -80,6 +80,13 @@
 - **WHEN** 클라이언트가 존재하지 않는 `GET /missing.js`를 요청한다
 - **THEN** 서버는 `404 Not Found`로 응답한다
 
+### Requirement: 파일 읽기 실패 응답
+서버는 경로 확인을 통과한 파일을 읽지 못하면(읽기 권한 없음, 확인 직후 삭제 등) `500 Internal Server Error`로 응답하고 원인을 로그에 남겨야 한다(SHALL).
+
+#### Scenario: 읽기 권한이 없는 파일
+- **WHEN** 웹 루트에 읽기 권한이 없는 일반 파일이 있고 클라이언트가 그 파일을 요청한다
+- **THEN** 서버는 `500 Internal Server Error`로 응답한다
+
 ### Requirement: 정상 종료
 서버는 `SIGINT` 또는 `SIGTERM`을 받으면 새 연결을 받지 않고 열린 소켓을 모두 닫은 뒤 종료 코드 0으로 끝나야 한다(SHALL).
 
