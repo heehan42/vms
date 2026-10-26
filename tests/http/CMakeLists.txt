@@ -1,0 +1,4 @@
+add_unit_test(http_response_test)
+add_unit_test(http_request_test)
+add_unit_test(mime_type_test)
+add_unit_test(static_files_test)

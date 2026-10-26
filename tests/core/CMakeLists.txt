@@ -1,0 +1,3 @@
+add_unit_test(unique_fd_test)
+add_unit_test(event_loop_test)
+add_unit_test(termination_signal_watcher_test)
