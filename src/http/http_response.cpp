@@ -22,8 +22,16 @@ std::string_view ReasonPhrase(HttpStatus status) {
             return "Not Found";
         case HttpStatus::kMethodNotAllowed:
             return "Method Not Allowed";
+        case HttpStatus::kLengthRequired:
+            return "Length Required";
+        case HttpStatus::kContentTooLarge:
+            return "Content Too Large";
+        case HttpStatus::kUnsupportedMediaType:
+            return "Unsupported Media Type";
         case HttpStatus::kInternalServerError:
             return "Internal Server Error";
+        case HttpStatus::kNotImplemented:
+            return "Not Implemented";
     }
     return "Unknown";
 }
@@ -46,10 +54,13 @@ std::string BuildResponse(HttpStatus status, std::string_view content_type, std:
 }
 
 
+std::string BuildErrorBody(HttpStatus status) {
+    return std::format("{} {}\n", StatusCodeNumber(status), ReasonPhrase(status));
+}
+
+
 std::string BuildErrorResponse(HttpStatus status, std::span<const HttpHeader> extra_headers) {
-    const std::string body =
-        std::format("{} {}\n", StatusCodeNumber(status), ReasonPhrase(status));
-    return BuildResponse(status, "text/plain; charset=utf-8", body, extra_headers);
+    return BuildResponse(status, kErrorContentType, BuildErrorBody(status), extra_headers);
 }
 
 

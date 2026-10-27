@@ -1,8 +1,11 @@
 #include "http/http_request.h"
 
 #include <algorithm>
+#include <charconv>
 #include <ranges>
 #include <utility>
+
+#include "core/ascii.h"
 
 
 namespace vms::http {
@@ -79,20 +82,80 @@ std::optional<HttpRequest> ParseRequestLine(std::string_view line) {
     if (!IsToken(method) || !is_valid_target || !is_valid_version) {
         return std::nullopt;
     }
-    return HttpRequest{.method = std::string(method), .target = std::string(target)};
+    HttpRequest request;
+    request.method = method;
+    request.target = target;
+    return request;
 }
 
 
-// "이름: 값" 형식의 헤더 줄인지 확인한다.
+// 헤더 줄 하나의 이름과 값.
+//
+// 두 필드 모두 파싱한 헤더 영역을 가리키므로, 원본 문자열이 살아 있는 동안에만 유효하다.
+struct HeaderField {
+    // 헤더 이름. 원문의 대소문자 그대로다.
+    std::string_view name;
+
+
+    // 앞뒤 공백과 탭을 뺀 헤더 값
+    std::string_view value;
+};
+
+
+// "이름: 값" 형식의 헤더 줄을 이름과 값으로 나눈다.
 //
 // line: 줄 구분자를 제외한 헤더 줄
-// 반환값: 이름이 토큰이고 값에 제어 문자가 없으면 true
-bool IsValidHeaderLine(std::string_view line) {
+// 반환값: 이름과 앞뒤 공백을 뺀 값. 이름이 토큰이 아니거나 값에 제어 문자가 있으면 빈 optional
+std::optional<HeaderField> ParseHeaderLine(std::string_view line) {
     const std::size_t colon = line.find(':');
     if (colon == std::string_view::npos) {
-        return false;
+        return std::nullopt;
     }
-    return IsToken(line.substr(0, colon)) && HasNoControlCharacter(line.substr(colon + 1));
+    const std::string_view name = line.substr(0, colon);
+    const std::string_view value = line.substr(colon + 1);
+    if (!IsToken(name) || !HasNoControlCharacter(value)) {
+        return std::nullopt;
+    }
+    return HeaderField{.name = name, .value = core::TrimAsciiWhitespace(value)};
+}
+
+
+// Content-Length 값을 바이트 수로 바꾼다.
+//
+// value: 앞뒤 공백을 뺀 헤더 값
+// 반환값: 바이트 수. 10진수 숫자만으로 이루어지지 않았거나 size_t 범위를 넘으면 빈 optional
+std::optional<std::size_t> ParseContentLength(std::string_view value) {
+    std::size_t length = 0;
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), length);
+    if (value.empty() || error != std::errc() || end != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    return length;
+}
+
+
+// 본문 수신과 라우팅에 쓰는 헤더이면 그 값을 요청에 기록한다.
+//
+// field: 파싱한 헤더 줄
+// request: 값을 기록할 요청
+// 반환값: Content-Length가 잘못되었거나 앞서 받은 값과 다르면 false
+bool RecordUsedHeader(const HeaderField& field, HttpRequest& request) {
+    if (core::EqualsIgnoringAsciiCase(field.name, "Content-Length")) {
+        const auto length = ParseContentLength(field.value);
+        if (!length) {
+            return false;
+        }
+        // 서로 다른 길이가 오면 어느 쪽이 본문 경계인지 알 수 없다.
+        if (request.content_length && *request.content_length != *length) {
+            return false;
+        }
+        request.content_length = *length;
+    } else if (core::EqualsIgnoringAsciiCase(field.name, "Content-Type")) {
+        request.content_type = std::string(field.value);
+    } else if (core::EqualsIgnoringAsciiCase(field.name, "Transfer-Encoding")) {
+        request.has_transfer_encoding = true;
+    }
+    return true;
 }
 
 
@@ -137,7 +200,8 @@ std::expected<HttpRequest, HttpStatus> ParseRequestHeader(std::string_view heade
 
     remaining.remove_prefix(request_line_end + kLineBreak.size());
     for (const auto line : std::views::split(remaining, kLineBreak)) {
-        if (!IsValidHeaderLine(std::string_view(line.begin(), line.end()))) {
+        const auto field = ParseHeaderLine(std::string_view(line.begin(), line.end()));
+        if (!field || !RecordUsedHeader(*field, *request)) {
             return std::unexpected(HttpStatus::kBadRequest);
         }
     }

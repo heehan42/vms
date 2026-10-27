@@ -18,7 +18,7 @@
 - **THEN** 서버는 `415 Unsupported Media Type`으로 응답한다
 
 ### Requirement: Offer 검증
-서버는 offer에서 BUNDLE로 묶인 첫 번째 비디오 미디어 섹션을 협상 대상으로 골라야 한다(SHALL). 그 섹션에 ICE 자격 증명(`a=ice-ufrag`, `a=ice-pwd`)이 없거나, `packetization-mode=1`인 H.264 코덱이 없거나, SDP 형식이 잘못되었으면 `400 Bad Request`로 응답하고 원인을 로그에 남긴다.
+서버는 offer에서 BUNDLE로 묶인 첫 번째 비디오 미디어 섹션을 협상 대상으로 골라야 한다(SHALL). 그 섹션에 `a=mid`나 ICE 자격 증명(`a=ice-ufrag`, `a=ice-pwd`)이 없거나, `packetization-mode=1`인 H.264 코덱이 없거나, SDP 형식이 잘못되었으면 `400 Bad Request`로 응답하고 원인을 로그에 남긴다.
 
 #### Scenario: 비디오 섹션이 없는 offer
 - **WHEN** 오디오 미디어 섹션만 있는 offer를 보낸다
@@ -33,7 +33,7 @@
 - **THEN** 서버는 `400 Bad Request`로 응답한다
 
 ### Requirement: Answer 내용
-서버는 Chrome이 `setRemoteDescription`으로 받아들이는 answer를 만들어야 한다(SHALL). 협상 대상 섹션은 offer의 `mid`, 선택한 H.264 payload type, `a=sendonly`, `a=rtcp-mux`, `a=ice-lite`, 이 세션에 새로 만든 ICE 자격 증명, 서버 인증서의 SHA-256 fingerprint, `a=setup:passive`, ICE 주소마다의 host candidate와 `a=end-of-candidates`를 포함한다. 나머지 미디어 섹션은 포트 0으로 거절한다.
+서버는 Chrome이 `setRemoteDescription`으로 받아들이는 answer를 만들어야 한다(SHALL). 협상 대상 섹션은 offer의 `mid`, 선택한 H.264 payload type, `a=sendonly`, `a=rtcp-mux`, `a=ice-lite`, 이 세션에 새로 만든 ICE 자격 증명, 서버 인증서의 SHA-256 fingerprint, `a=setup:passive`, ICE 주소마다의 host candidate와 `a=end-of-candidates`를 포함한다. 나머지 미디어 섹션은 포트 0으로 거절한다. offer에 BUNDLE 그룹이 있었을 때만 협상 대상 섹션으로 이루어진 BUNDLE 그룹을 넣는다.
 
 #### Scenario: 브라우저가 answer 적용
 - **WHEN** 연결 확인 페이지가 서버의 answer로 `setRemoteDescription`을 호출한다

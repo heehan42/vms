@@ -55,6 +55,18 @@ void TestBuildsEachErrorStatusLine() {
     Expect(BuildErrorResponse(HttpStatus::kInternalServerError)
                .starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
            "500 상태 줄");
+    Expect(BuildErrorResponse(HttpStatus::kLengthRequired)
+               .starts_with("HTTP/1.1 411 Length Required\r\n"),
+           "411 상태 줄");
+    Expect(BuildErrorResponse(HttpStatus::kContentTooLarge)
+               .starts_with("HTTP/1.1 413 Content Too Large\r\n"),
+           "413 상태 줄");
+    Expect(BuildErrorResponse(HttpStatus::kUnsupportedMediaType)
+               .starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"),
+           "415 상태 줄");
+    Expect(BuildErrorResponse(HttpStatus::kNotImplemented)
+               .starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+           "501 상태 줄");
 }
 
 

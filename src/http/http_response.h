@@ -27,8 +27,20 @@ enum class HttpStatus {
     // 지원하지 않는 메서드
     kMethodNotAllowed = 405,
 
-    // 확인한 파일을 읽지 못함
+    // 본문이 필요한 경로에 Content-Length가 없음
+    kLengthRequired = 411,
+
+    // 본문이 허용 크기를 넘음
+    kContentTooLarge = 413,
+
+    // 엔드포인트가 받지 않는 본문 형식(Content-Type)
+    kUnsupportedMediaType = 415,
+
+    // 확인한 파일을 읽지 못했거나 엔드포인트 처리 중 내부 오류
     kInternalServerError = 500,
+
+    // 지원하지 않는 전송 방식(Transfer-Encoding)
+    kNotImplemented = 501,
 };
 
 
@@ -71,6 +83,17 @@ std::string_view ReasonPhrase(HttpStatus status);
 // 응답 후 연결을 닫는 서버 정책에 맞춰 keep-alive는 지원하지 않는다.
 std::string BuildResponse(HttpStatus status, std::string_view content_type, std::string_view body,
                           std::span<const HttpHeader> extra_headers = {});
+
+
+// 오류 응답 본문의 Content-Type
+inline constexpr std::string_view kErrorContentType = "text/plain; charset=utf-8";
+
+
+// 오류 응답 본문을 만든다.
+//
+// status: 오류 상태 코드
+// 반환값: "404 Not Found\n" 형식의 본문
+std::string BuildErrorBody(HttpStatus status);
 
 
 // 상태 코드와 사유 문구를 본문으로 하는 오류 응답 바이트를 만든다.

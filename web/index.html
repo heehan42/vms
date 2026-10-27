@@ -9,6 +9,18 @@
     <h1>WebRTC 동영상 재생</h1>
     <!-- app.js가 실행되면 이 문구를 바꾼다. 문구가 그대로면 스크립트 전달에 실패한 것이다. -->
     <p id="script-status">app.js를 불러오지 못했습니다.</p>
+
+    <h2>연결 확인</h2>
+    <button id="connect-button" type="button">연결</button>
+    <!-- 아직 DTLS를 구현하지 않았으므로, ICE 상태가 connected가 된 뒤 연결 상태는 failed가 되는 것이 정상이다. -->
+    <dl>
+        <dt>시그널링</dt>
+        <dd id="signaling-status">시작 전</dd>
+        <dt>ICE 상태 (iceConnectionState)</dt>
+        <dd id="ice-state">-</dd>
+        <dt>연결 상태 (connectionState)</dt>
+        <dd id="connection-state">-</dd>
+    </dl>
     <script src="app.js"></script>
 </body>
 </html>

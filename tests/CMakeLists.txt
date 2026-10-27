@@ -10,5 +10,7 @@ function(add_unit_test name)
 endfunction()
 
 add_subdirectory(core)
+add_subdirectory(crypto)
 add_subdirectory(http)
+add_subdirectory(webrtc)
 add_subdirectory(integration)

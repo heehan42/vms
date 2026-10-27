@@ -1,0 +1,3 @@
+add_unit_test(random_test)
+add_unit_test(hmac_sha1_test)
+add_unit_test(certificate_test)

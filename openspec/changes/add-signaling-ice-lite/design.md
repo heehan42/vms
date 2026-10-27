@@ -42,6 +42,7 @@
 src/
   apps/web_server/main.cpp        인자 해석, 인증서·ICE 에이전트·HTTP 서버 조립
   core/
+    ascii.h                       대소문자 무시 비교, 공백 제거 같은 ASCII 문자열 도구 (신규)
     network_interfaces.h/.cpp     루프백이 아닌 IPv4 인터페이스 주소 조회 (신규)
   crypto/                         OpenSSL C API 래퍼 (신규)
     openssl_error.h/.cpp          OpenSSL 오류 큐 -> 오류 메시지
@@ -215,7 +216,7 @@ stateDiagram-v2
 - **문법 층**: 줄(`\r\n` 또는 `\n`)을 `<한 글자 타입>=<값>`으로 나누고, 첫 `m=` 앞을 세션 영역, 각 `m=`부터를 미디어 섹션으로 묶는다. `a=` 줄은 `이름[:값]`으로 나눈다. 첫 줄이 `v=0`이 아니거나 `=`이 없는 줄이 있으면 형식 오류다. 모르는 타입과 속성은 보관만 하고 해석하지 않는다.
 - **의미 층(offer 해석)**: 필요한 값만 꺼내 `SdpOffer` 구조체로 만든다.
   - 세션 수준 `a=group:BUNDLE`
-  - BUNDLE에 포함된 첫 `m=video` 섹션의 `mid`
+  - BUNDLE 그룹이 있었는지 여부와, 그 그룹에 포함된 첫 `m=video` 섹션의 `mid`(없으면 형식 오류)
   - `ice-ufrag`, `ice-pwd`. 미디어 수준을 우선하고, 없으면 세션 수준을 쓴다.
   - H.264 payload type과 그 `fmtp`
   - 나머지 섹션의 미디어 종류, 프로토콜, 포맷, `mid`(거절 섹션을 만들 때 쓴다)
@@ -227,7 +228,7 @@ v=0
 o=- <난수 세션 ID> 2 IN IP4 127.0.0.1
 s=-
 t=0 0
-a=group:BUNDLE <mid>
+a=group:BUNDLE <mid>                                         (offer에 BUNDLE 그룹이 있을 때만)
 a=ice-lite
 m=video 9 UDP/TLS/RTP/SAVPF <pt>
 c=IN IP4 0.0.0.0
@@ -265,6 +266,9 @@ a=mid:<mid>
 - 그 밖의 값: 버림
 
 이번에는 STUN만 처리한다. DTLS와 RTP는 원격 주소별로 처음 한 번만 로그를 남기고 버린다. 이후 마일스톤에서 이 분기에 DTLS 처리를 연결한다.
+
+- 로그 중복을 막으려고 기억하는 원격 주소는 256개까지만 둔다. 출발 주소를 바꿔 가며 보내는 패킷으로 메모리가 계속 늘지 않도록, 가득 차면 비우고 다시 기록한다.
+- 읽기 이벤트 한 번에 최대 64개 데이터그램만 처리하고 루프로 돌아간다. 패킷이 계속 들어와도 HTTP 등 다른 소켓이 처리된다. 루프가 level-triggered이므로 남은 패킷은 다음 대기에서 다시 알려 준다.
 
 ```mermaid
 flowchart TD
@@ -313,7 +317,9 @@ flowchart TD
 
 - 소유 포인터는 `std::unique_ptr`에 해제 함수를 지정한 별칭으로 다룬다(`EVP_PKEY_free`, `X509_free` 등).
 - 오류는 `std::expected<T, std::string>`으로 돌려준다. 메시지는 OpenSSL 오류 큐를 `ERR_error_string_n`으로 읽어 만들고, 읽은 뒤 큐를 비운다. OpenSSL 오류는 `errno`가 아니므로 `std::error_code`로 바꾸지 않는다.
-- HMAC은 OpenSSL 3에서도 폐지 예정이 아닌 일회성 함수 `HMAC(EVP_sha1(), ...)`를 쓴다. 폐지 예정인 `HMAC_CTX_*`는 쓰지 않는다.
+- HMAC은 OpenSSL 3의 `EVP_MAC`("HMAC", 다이제스트 SHA1)으로 계산한다. 폐지 예정인 `HMAC_CTX_*`는 쓰지 않는다.
+  - 데이터를 여러 조각으로 넣을 수 있어, MESSAGE-INTEGRITY 검증 때 길이 필드를 고친 20바이트 헤더 복사본과 원본 나머지를 따로 넘긴다. 요청마다 패킷 전체를 복사하지 않는다.
+  - 알고리즘 조회(`EVP_MAC_fetch`)는 처음 한 번만 하고 프로세스 수명 동안 재사용한다.
 - 인증서는 다음과 같이 만든다.
   - `EVP_EC_gen("P-256")`으로 키를 만든다.
   - X509v3, 난수 일련번호, 유효 기간은 시작 1일 전부터 30일, CN은 `vms`로 하고 SHA-256으로 자체 서명한다.
@@ -367,6 +373,7 @@ flowchart TD
     1. `.wslconfig`의 `networkingMode=mirrored`
     2. Hyper-V 방화벽 허용
     3. `--ice-address`
+  - **확인 결과(2026-10-26)**: WSL2 NAT 모드(설정 파일에 `networkingMode` 없음)에서 Windows PowerShell이 WSL `eth0` 주소(`172.27.209.81`)로 보낸 UDP가 도착했고, WSL의 응답도 Windows로 돌아갔다. Windows 쪽 출발 주소는 vEthernet(WSL) 어댑터의 `172.27.208.1`로 보였다. 따라서 NAT 모드 그대로 기본 주소 자동 조회(`eth0`)를 쓴다. 참고로 `lo`에는 `127.0.0.1` 외에 WSL DNS 터널링용 `10.255.255.254`가 붙어 있으며, 루프백 인터페이스이므로 자동 조회에서 빠진다.
 - [Chrome이 answer를 예상과 다른 이유로 거부할 수 있다] → 손으로 만든 SDP가 아니라 실제 Chrome offer를 견본으로 쓴다. 거부되면 `setRemoteDescription` 오류 문구와 webrtc-internals로 원인을 좁혀 템플릿을 고친다.
 - [STUN 오류 응답이 없어 브라우저 쪽에서는 실패 원인을 구분할 수 없다] → 서버가 검증 실패 원인을 패킷마다 로그로 남긴다. 반복되는 패킷 때문에 로그가 많아지면 원격 주소별로 묶는다.
 - [세션 만료가 없어 offer마다 만든 세션이 프로세스가 끝날 때까지 남는다] → 세션 하나는 수백 바이트이고 로컬 개발 중 offer는 많아야 수백 번이므로 감수한다. 제거된 세션이 없으므로, 페이지를 새로 고친 뒤에도 이전 세션의 자격 증명으로 온 요청에 계속 응답한다. 이후 마일스톤에서 타이머를 넣을 때 마지막 유효 요청 후 30초 만료를 추가한다. 외부에 공개하기 전에는 세션 수와 요청 속도 제한도 넣는다.

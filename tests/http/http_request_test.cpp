@@ -99,6 +99,51 @@ void TestRejectsMalformedHeaderLine() {
 }
 
 
+// 본문 관련 헤더 값을 대소문자 구분 없이 보관하는지 검사한다.
+void TestRecordsBodyHeaders() {
+    const auto request = ParseRequestHeader(
+        "POST /offer HTTP/1.1\r\ncontent-length:  1234 \r\nCONTENT-TYPE: application/sdp\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n");
+    if (!request) {
+        Expect(false, "본문 헤더가 있는 요청 파싱");
+        return;
+    }
+    Expect(request->content_length == 1234u, "앞뒤 공백을 뺀 Content-Length");
+    Expect(request->content_type == "application/sdp", "앞뒤 공백을 뺀 Content-Type");
+    Expect(request->has_transfer_encoding, "Transfer-Encoding 유무");
+}
+
+
+// 본문 헤더가 없으면 길이 없음, 빈 Content-Type, 전송 인코딩 없음으로 두는지 검사한다.
+void TestLeavesMissingBodyHeadersEmpty() {
+    const auto request = ParseRequestHeader("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    if (!request) {
+        Expect(false, "본문 헤더가 없는 요청 파싱");
+        return;
+    }
+    Expect(!request->content_length, "Content-Length가 없으면 빈 optional");
+    Expect(request->content_type.empty(), "Content-Type이 없으면 빈 문자열");
+    Expect(!request->has_transfer_encoding, "Transfer-Encoding이 없으면 false");
+}
+
+
+// 잘못된 Content-Length와 서로 다른 값으로 중복된 Content-Length를 400으로 거부하는지 검사한다.
+void TestRejectsInvalidContentLength() {
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), "숫자가 아닌 길이");
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n"), "음수 길이");
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n"), "부호가 붙은 길이");
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length:\r\n\r\n"), "빈 길이");
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n"),
+           "범위를 넘는 길이");
+    Expect(IsRejected("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"),
+           "서로 다른 값으로 중복된 길이");
+
+    const auto same_twice =
+        ParseRequestHeader("POST / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\n");
+    Expect(same_twice && same_twice->content_length == 5u, "같은 값의 중복은 허용해야 한다");
+}
+
+
 }  // namespace
 
 
@@ -110,5 +155,8 @@ int main() {
     TestParsesRequestWithoutHeaders();
     TestRejectsMalformedRequestLine();
     TestRejectsMalformedHeaderLine();
+    TestRecordsBodyHeaders();
+    TestLeavesMissingBodyHeadersEmpty();
+    TestRejectsInvalidContentLength();
     return vms::test::ExitCode();
 }

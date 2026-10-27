@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# vms_web_server를 임시 웹 루트로 실행하고 http-server 명세의 시나리오를 실제 요청으로 검사한다.
+# vms_web_server를 임시 웹 루트로 실행하고 http-server, webrtc-signaling 명세의 시나리오를
+# 실제 요청으로 검사한다.
 #
-# 사용법: http_server_test.sh <vms_web_server 실행 파일 경로>
-# 포트는 HTTP_SERVER_TEST_PORT 환경 변수로 바꿀 수 있다(기본 18080).
+# 사용법: http_server_test.sh <vms_web_server 실행 파일 경로> <Chrome offer 견본 경로>
+# HTTP 포트는 HTTP_SERVER_TEST_PORT(기본 18080), ICE UDP 포트는 ICE_TEST_PORT(기본 18090)
+# 환경 변수로 바꿀 수 있다.
 
 set -u
 
 server_binary="$1"
+chrome_offer="$2"
 port="${HTTP_SERVER_TEST_PORT:-18080}"
+ice_port="${ICE_TEST_PORT:-18090}"
 base_url="http://localhost:${port}"
 
 work_dir="$(mktemp -d)"
@@ -56,6 +60,12 @@ raw_status() {
     nc -w 5 localhost "${port}" | head -n 1 | cut -d ' ' -f 2
 }
 
+# offer 견본을 POST /offer로 보내고 응답 헤더와 본문을 함께 출력한다(CR 제거).
+# 추가 인자는 curl에 그대로 넘긴다.
+post_offer() {
+    curl -s -D - --data-binary "@${chrome_offer}" "$@" "${base_url}/offer" | tr -d '\r'
+}
+
 mkdir -p "${web_root}/assets"
 printf '<p>index</p>' > "${web_root}/index.html"
 printf 'console.log("app");' > "${web_root}/app.js"
@@ -63,7 +73,8 @@ printf 'binary' > "${web_root}/data.bin"
 printf 'secret' > "${web_root}/unreadable.txt"
 chmod 000 "${web_root}/unreadable.txt"
 
-"${server_binary}" --port "${port}" --web-root "${web_root}" 2> "${server_log}" &
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" 2> "${server_log}" &
 server_pid=$!
 
 # 서버가 연결을 받을 수 있을 때까지 최대 5초 기다린다.
@@ -91,6 +102,16 @@ expect_equal "헤더 크기 초과" "400" "$(printf 'GET / HTTP/1.1\r\nX-Long: %
 expect_equal "POST는 405" "405" "$(status_of / -X POST)"
 expect_equal "405의 Allow 헤더" "GET" \
     "$(curl -s -D - -o /dev/null -X POST "${base_url}/" | tr -d '\r' | grep -i '^Allow:' | cut -d ' ' -f 2-)"
+
+# 본문 관련 헤더 오류. 이 판정은 경로와 무관하게 헤더 단계에서 이루어진다.
+# 413은 lingering close가 없어 본문을 보내는 중이면 응답이 RST로 사라질 수 있으므로 헤더만 보낸다.
+expect_equal "잘못된 Content-Length" "400" \
+    "$(printf 'GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n' | raw_status)"
+expect_equal "chunked 전송" "501" \
+    "$(printf 'GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n' | raw_status)"
+expect_equal "본문 크기 초과" "413" \
+    "$(printf 'GET / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n' | raw_status)"
+
 expect_equal "상위 디렉터리 접근" "403" "$(status_of /../etc/passwd)"
 expect_equal "없는 파일" "404" "$(status_of /missing.js)"
 
@@ -100,6 +121,38 @@ if (( EUID == 0 )); then
 else
     expect_equal "읽기 권한이 없는 파일" "500" "$(status_of /unreadable.txt)"
 fi
+
+# 시그널링: offer 견본에 대한 answer
+sdp_header=(-H 'Content-Type: application/sdp')
+first_answer="$(post_offer "${sdp_header[@]}")"
+second_answer="$(post_offer "${sdp_header[@]}")"
+expect_equal "offer 상태" "HTTP/1.1 200 OK" "$(head -n 1 <<< "${first_answer}")"
+expect_equal "answer Content-Type" "application/sdp" \
+    "$(grep -i '^Content-Type:' <<< "${first_answer}" | cut -d ' ' -f 2-)"
+expect_equal "answer의 ice-lite" "1" "$(grep -c '^a=ice-lite$' <<< "${first_answer}")"
+expect_equal "answer의 127.0.0.1 candidate" "1" \
+    "$(grep -c "^a=candidate:1 1 udp [0-9]* 127.0.0.1 ${ice_port} typ host$" <<< "${first_answer}")"
+first_ufrag="$(grep '^a=ice-ufrag:' <<< "${first_answer}")"
+second_ufrag="$(grep '^a=ice-ufrag:' <<< "${second_answer}")"
+if [[ -n "${first_ufrag}" && "${first_ufrag}" != "${second_ufrag}" ]]; then
+    expect_equal "answer마다 다른 ufrag" "다름" "다름"
+else
+    expect_equal "answer마다 다른 ufrag" "다름" "같음 또는 없음"
+fi
+expect_equal "answer마다 같은 fingerprint" "$(grep '^a=fingerprint:' <<< "${first_answer}")" \
+    "$(grep '^a=fingerprint:' <<< "${second_answer}")"
+
+# 시그널링 요청 오류
+expect_equal "offer Content-Type 오류" "415" \
+    "$(status_of /offer --data-binary "@${chrome_offer}" -H 'Content-Type: text/plain')"
+expect_equal "SDP가 아닌 offer" "400" "$(status_of /offer --data-binary hello "${sdp_header[@]}")"
+expect_equal "GET /offer는 405" "405" "$(status_of /offer)"
+expect_equal "GET /offer의 Allow 헤더" "POST" "$(header_of /offer Allow)"
+expect_equal "길이 없는 POST /offer" "411" "$(printf 'POST /offer HTTP/1.1\r\n\r\n' | raw_status)"
+expect_equal "chunked POST /offer" "501" \
+    "$(printf 'POST /offer HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n' | raw_status)"
+expect_equal "큰 본문 POST /offer" "413" \
+    "$(printf 'POST /offer HTTP/1.1\r\nContent-Length: 100000\r\n\r\n' | raw_status)"
 
 # 요청을 끝내지 않은 연결이 있어도 다른 요청은 바로 처리되어야 한다.
 # nc만 백그라운드 작업으로 두어야 nc를 종료한 뒤 남은 sleep을 기다리지 않는다.
