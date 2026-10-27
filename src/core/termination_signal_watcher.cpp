@@ -20,6 +20,16 @@ std::expected<TerminationSignalWatcher, std::error_code> TerminationSignalWatche
     ::sigaddset(&signals, SIGINT);
     ::sigaddset(&signals, SIGTERM);
 
+    // 무시(SIG_IGN)로 설정된 시그널은 막아 두어도 대기 상태가 되지 않고 버려져 signalfd에 오지 않는다.
+    // 셸이 백그라운드 작업의 SIGINT를 무시로 바꿔 실행하는 경우가 있으므로 기본 동작으로 되돌린다.
+    struct sigaction default_action{};
+    default_action.sa_handler = SIG_DFL;
+    ::sigemptyset(&default_action.sa_mask);
+    if (::sigaction(SIGINT, &default_action, nullptr) != 0 ||
+        ::sigaction(SIGTERM, &default_action, nullptr) != 0) {
+        return std::unexpected(LastSystemError());
+    }
+
     // 시그널을 막아 두어야 기본 동작(프로세스 종료) 대신 signalfd에 대기 상태로 쌓인다.
     if (::sigprocmask(SIG_BLOCK, &signals, nullptr) != 0) {
         return std::unexpected(LastSystemError());

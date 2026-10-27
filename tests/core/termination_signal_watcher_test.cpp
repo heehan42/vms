@@ -18,6 +18,9 @@ int main() {
         return vms::test::ExitCode();
     }
 
+    // 셸이 백그라운드 작업을 실행할 때처럼 SIGINT를 무시로 둔 상태에서 시작해도 받을 수 있어야 한다.
+    ::signal(SIGINT, SIG_IGN);
+
     int received_signal = 0;
     auto watcher = TerminationSignalWatcher::Start(*loop, [&](int signal_number) {
         received_signal = signal_number;
@@ -33,5 +36,9 @@ int main() {
 
     Expect(!loop->Run(), "시그널을 받은 뒤 Run이 오류 없이 반환되어야 한다");
     Expect(received_signal == SIGTERM, "핸들러가 SIGTERM 번호를 받아야 한다");
+
+    ::kill(::getpid(), SIGINT);
+    Expect(!loop->Run(), "SIGINT를 받은 뒤 Run이 오류 없이 반환되어야 한다");
+    Expect(received_signal == SIGINT, "시작 전 무시로 설정된 SIGINT도 핸들러가 받아야 한다");
     return vms::test::ExitCode();
 }

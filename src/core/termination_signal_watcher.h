@@ -34,6 +34,8 @@ public:
     // 프로세스의 시그널 마스크를 바꾸므로, 다른 스레드를 만들기 전에 호출해야
     // 모든 스레드가 같은 마스크를 물려받는다. 이후 SIGINT, SIGTERM으로는 프로세스가
     // 바로 종료되지 않고, 핸들러가 종료 처리를 맡는다.
+    // 무시(SIG_IGN)로 설정된 시그널은 signalfd로 전달되지 않으므로, 두 시그널의 처리 방식을
+    // 기본 동작(SIG_DFL)으로 되돌린 뒤 막는다.
     static std::expected<TerminationSignalWatcher, std::error_code> Start(EventLoop& loop,
                                                                           Handler on_signal);
 
