@@ -19,7 +19,7 @@
 ## 4. OpenSSL 래퍼
 
 - [x] 4.1 `src/crypto/openssl_error.h/.cpp`와 `src/crypto/random.h/.cpp`에 오류 큐 메시지 변환, `RAND_bytes` 기반 난수 바이트와 `ice-char` 문자열 생성을 구현한다. 단위 테스트로 생성 문자열의 길이와 문자 집합, 두 번 생성한 값이 서로 다른지 확인한다
-- [x] 4.2 `src/crypto/hmac_sha1.h/.cpp`에 일회성 `HMAC(EVP_sha1(), ...)` 래퍼를 구현하고, `tests/crypto/hmac_sha1_test.cpp`로 RFC 2202 테스트 벡터를 통과하는지 확인한다
+- [x] 4.2 `src/crypto/hmac_sha1.h/.cpp`에 OpenSSL 3의 `EVP_MAC`(HMAC, SHA1) 기반으로 데이터를 여러 조각으로 받는 래퍼를 구현하고, `tests/crypto/hmac_sha1_test.cpp`로 RFC 2202 테스트 벡터를 통과하는지 확인한다
 - [x] 4.3 `src/crypto/certificate.h/.cpp`에 ECDSA P-256 자체 서명 인증서와 키 생성, SHA-256 fingerprint 문자열 생성을 구현한다. `tests/crypto/certificate_test.cpp`로 생성 성공, fingerprint 형식(대문자 16진수 32쌍, `:` 구분, 95자), 같은 인증서의 fingerprint가 같은지 확인한다
 
 ## 5. STUN 메시지

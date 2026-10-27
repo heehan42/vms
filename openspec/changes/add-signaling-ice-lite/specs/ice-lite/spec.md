@@ -7,18 +7,18 @@
 ## ADDED Requirements
 
 ### Requirement: ICE 실행 설정
-서버는 ICE용 UDP 포트(`--ice-port`, 기본 50000)와 candidate로 알릴 IPv4 주소(`--ice-address`, 여러 번 지정 가능)를 명령행 인자로 받아야 한다(SHALL). 주소를 지정하지 않으면 동작 중인 인터페이스의 IPv4 주소 중 루프백이 아닌 것을 모두 사용한다. 각 주소마다 그 주소와 포트에 UDP 소켓을 연다.
+서버는 ICE용 UDP 포트(`--ice-port`, 기본 50000)와 candidate로 알릴 IPv4 주소(`--ice-address`, 여러 번 지정 가능)를 명령행 인자로 받아야 한다(SHALL). 지정하는 주소는 이 머신의 인터페이스에 있는 주소여야 한다. 주소를 지정하지 않으면 동작 중인 인터페이스의 IPv4 주소 중 루프백이 아닌 것을 모두 사용한다. 각 주소마다 그 주소와 포트에 UDP 소켓을 연다.
 
 #### Scenario: 기본값으로 실행
 - **WHEN** ICE 인자 없이 서버를 실행한다
 - **THEN** 서버는 루프백이 아닌 각 IPv4 인터페이스 주소의 50000번 UDP 포트에서 패킷을 받고, 사용하는 주소 목록을 로그에 출력한다
 
 #### Scenario: 주소 지정
-- **WHEN** `--ice-port 50100 --ice-address 127.0.0.1 --ice-address 192.168.0.10`으로 실행한다
+- **WHEN** 인터페이스 주소가 `127.0.0.1`과 `192.168.0.10`인 머신에서 `--ice-port 50100 --ice-address 127.0.0.1 --ice-address 192.168.0.10`으로 실행한다
 - **THEN** 서버는 두 주소의 50100번 UDP 포트에서만 패킷을 받고, answer에는 두 주소의 candidate만 들어간다
 
 #### Scenario: ICE 시작 실패
-- **WHEN** 지정한 주소가 IPv4 형식이 아니거나, UDP 포트에 바인드할 수 없거나, 사용할 주소가 하나도 없다
+- **WHEN** 지정한 주소가 IPv4 형식이 아니거나, 이 머신의 인터페이스에 없는 주소이거나, UDP 포트에 바인드할 수 없거나, 사용할 주소가 하나도 없다
 - **THEN** 서버는 원인을 표준 오류에 출력하고 0이 아닌 종료 코드로 끝난다
 
 ### Requirement: Binding 요청 응답
@@ -33,7 +33,7 @@
 - **THEN** 응답의 `MESSAGE-INTEGRITY`는 서버 `ice-pwd`로, `FINGERPRINT`는 CRC32 규칙으로 검증에 통과하고, `XOR-MAPPED-ADDRESS`는 클라이언트의 주소와 포트와 같다
 
 ### Requirement: 잘못된 요청 무시
-서버는 검증에 실패한 패킷에 응답하지 않고 원인을 로그에 남겨야 한다(SHALL). STUN 형식이 아니거나, `FINGERPRINT`가 없거나 틀리거나, `USERNAME`이 어떤 세션과도 맞지 않거나, `MESSAGE-INTEGRITY`가 없거나 틀린 요청이 이에 해당한다. 서버는 이런 패킷 때문에 종료되거나 다른 세션의 처리를 멈추지 않는다.
+서버는 검증에 실패한 패킷에 응답하지 않고 원인을 로그에 남겨야 한다(SHALL). STUN 형식이 아니거나, `FINGERPRINT`가 없거나 틀리거나, `USERNAME`이 어떤 세션과도 맞지 않거나, `MESSAGE-INTEGRITY`가 없거나 틀린 요청이 이에 해당한다. 첫 바이트로 STUN이 아니라고 판정한 패킷(DTLS, RTP 등)은 브라우저가 재전송하므로 원격 주소마다 처음 한 번만 로그를 남긴다. 서버는 이런 패킷 때문에 종료되거나 다른 세션의 처리를 멈추지 않는다.
 
 #### Scenario: 틀린 비밀번호
 - **WHEN** 세션의 `USERNAME`은 맞지만 다른 비밀번호로 서명한 Binding 요청이 도착한다

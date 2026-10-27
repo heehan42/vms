@@ -35,10 +35,14 @@
 - **THEN** 서버는 헤더 뒤의 바이트를 본문으로 사용해 요청을 처리한다
 
 ### Requirement: 요청 본문 오류 응답
-서버는 본문을 받을 수 없는 요청에 오류로 응답해야 한다(SHALL). `Content-Length` 값이 음이 아닌 10진수가 아니면 `400 Bad Request`, 64 KiB를 넘으면 `413 Content Too Large`, `Transfer-Encoding` 헤더가 있으면 `501 Not Implemented`, 본문이 필요한 경로에 `Content-Length`가 없으면 `411 Length Required`로 응답한다.
+서버는 본문을 받을 수 없는 요청에 오류로 응답해야 한다(SHALL). `Content-Length` 값이 음이 아닌 10진수가 아니거나 서로 다른 값으로 여러 번 오면 `400 Bad Request`, 64 KiB를 넘으면 `413 Content Too Large`, `Transfer-Encoding` 헤더가 있으면 `501 Not Implemented`, 본문이 필요한 경로에 `Content-Length`가 없으면 `411 Length Required`로 응답한다.
 
 #### Scenario: 잘못된 Content-Length
 - **WHEN** 클라이언트가 `Content-Length: abc`인 요청을 보낸다
+- **THEN** 서버는 `400 Bad Request`로 응답한다
+
+#### Scenario: 서로 다른 Content-Length
+- **WHEN** 클라이언트가 `Content-Length: 10`과 `Content-Length: 20`을 함께 담은 요청을 보낸다
 - **THEN** 서버는 `400 Bad Request`로 응답한다
 
 #### Scenario: 본문 크기 초과

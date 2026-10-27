@@ -59,7 +59,7 @@ src/
     signaling.h/.cpp              POST /offer 핸들러: offer 해석 -> 세션 생성 -> answer
 tests/
   core/network_interfaces_test.cpp
-  crypto/hmac_sha1_test.cpp, certificate_test.cpp
+  crypto/random_test.cpp, hmac_sha1_test.cpp, certificate_test.cpp
   webrtc/sdp_test.cpp, stun_message_test.cpp, ice_lite_agent_test.cpp
   webrtc/data/chrome_offer.sdp    실제 Chrome에서 받은 offer 견본
   integration/http_server_test.sh 시그널링과 본문 오류 시나리오 추가
@@ -216,12 +216,12 @@ stateDiagram-v2
 - **문법 층**: 줄(`\r\n` 또는 `\n`)을 `<한 글자 타입>=<값>`으로 나누고, 첫 `m=` 앞을 세션 영역, 각 `m=`부터를 미디어 섹션으로 묶는다. `a=` 줄은 `이름[:값]`으로 나눈다. 첫 줄이 `v=0`이 아니거나 `=`이 없는 줄이 있으면 형식 오류다. 모르는 타입과 속성은 보관만 하고 해석하지 않는다.
 - **의미 층(offer 해석)**: 필요한 값만 꺼내 `SdpOffer` 구조체로 만든다.
   - 세션 수준 `a=group:BUNDLE`
-  - BUNDLE 그룹이 있었는지 여부와, 그 그룹에 포함된 첫 `m=video` 섹션의 `mid`(없으면 형식 오류)
+  - BUNDLE 그룹이 있었는지 여부와, 협상 대상인 첫 `m=video` 섹션의 `mid`(없으면 형식 오류). 포트가 0인 섹션은 거절되었거나 꺼진 섹션이므로 건너뛰고, BUNDLE 그룹이 있으면 그 그룹에 속한 섹션 중에서만 고른다.
   - `ice-ufrag`, `ice-pwd`. 미디어 수준을 우선하고, 없으면 세션 수준을 쓴다.
   - H.264 payload type과 그 `fmtp`
   - 나머지 섹션의 미디어 종류, 프로토콜, 포맷, `mid`(거절 섹션을 만들 때 쓴다)
 - **H.264 선택**: `rtpmap`이 `H264/90000`이고 `fmtp`에 `packetization-mode=1`이 있는 payload를 고른다. 그중 `profile-level-id=42e01f`(Constrained Baseline)를 우선하고, 없으면 첫 번째를 쓴다. 이후 마일스톤에서 미디어 송신을 구현할 때 서버가 보낼 스트림과 호환되는 프로파일로 바꿀 수 있으며, 명세는 바뀌지 않는다.
-- **answer 생성**: 고정 템플릿에 값을 채운다. 줄 끝은 `\r\n`이다.
+- **answer 생성**: 고정 템플릿에 값을 채운다. 줄 끝은 `\r\n`이다. 미디어 섹션은 offer와 같은 개수와 순서로 쓴다(RFC 3264). 아래 템플릿은 비디오 섹션이 첫 번째인 경우이며, 거절 섹션은 offer에서의 위치에 그대로 놓인다.
 
 ```
 v=0
@@ -273,7 +273,7 @@ a=mid:<mid>
 ```mermaid
 flowchart TD
     P["UDP 패킷 수신"] --> D{"첫 바이트 0..3?"}
-    D -->|아니오| X1["STUN 아님: 버림"]
+    D -->|아니오| X1["STUN 아님: 버림<br/>원격 주소별 첫 패킷만 로그"]
     D -->|예| H{"헤더 형식<br/>magic cookie, 길이가 4의 배수,<br/>길이가 데이터그램 크기와 일치"}
     H -->|실패| X2["버림, 로그"]
     H -->|통과| F{"마지막 속성이 FINGERPRINT이고<br/>CRC32 XOR 0x5354554E와 일치?"}
@@ -341,12 +341,14 @@ flowchart TD
 - **단위 테스트**
   - `network_interfaces_test`: 결과에 루프백 주소가 없고 오류 없이 반환되는지
   - `http_request_test`: `Content-Length`, `Content-Type`, `Transfer-Encoding` 해석, 잘못된 값, 다른 값으로 중복
+  - `random_test`: `ice-char` 문자열의 길이와 문자 집합, 두 번 생성한 값이 서로 다른지
   - `hmac_sha1_test`: RFC 2202 테스트 벡터
   - `certificate_test`: 인증서 생성, fingerprint 형식(32바이트, 95자), 같은 인증서의 fingerprint가 같은지
   - `stun_message_test`
     - CRC32: `"123456789"` → `0xCBF43926`
     - RFC 5769 2.1 견본 요청: 해석, FINGERPRINT·MESSAGE-INTEGRITY 검증(비밀번호 `VOkJxbRl1RmTxUk/WvJxBt`), 틀린 비밀번호 거부
     - RFC 5769 2.2 견본 응답: `XOR-MAPPED-ADDRESS` 해독(`192.0.2.1:32853`)
+    - 잘린 패킷과 잘못된 magic cookie 거부
     - 직접 만든 성공 응답이 검증을 통과하는지
   - `sdp_test`: `chrome_offer.sdp` 견본에서 mid, ufrag/pwd, H.264 payload 선택. 비디오 없음, H.264 없음, 형식 오류. answer의 필수 줄 포함, 오디오 섹션 거절과 BUNDLE 제외.
   - `ice_lite_agent_test`: 루프와 에이전트를 `127.0.0.1`, 포트 0으로 띄우고 테스트 UDP 소켓으로 다음을 확인한다.

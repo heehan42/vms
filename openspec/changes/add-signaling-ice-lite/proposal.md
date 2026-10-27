@@ -9,7 +9,7 @@
 - 브라우저가 SDP offer를 `POST /offer`로 보내면 서버가 SDP answer로 응답하는 시그널링 엔드포인트를 추가한다.
 - 서버를 ICE-lite 에이전트로 동작시킨다. UDP 소켓에서 STUN Binding 요청을 검증(USERNAME, MESSAGE-INTEGRITY, FINGERPRINT)하고 응답하며, `USE-CANDIDATE`를 받으면 연결이 수립된 것으로 기록한다.
 - 시작할 때 자체 서명 인증서를 만들어 answer의 `a=fingerprint`에 넣는다. Chrome은 fingerprint가 없는 answer를 거부하기 때문이며, DTLS 핸드셰이크 자체는 이후 마일스톤에서 구현한다.
-- HTTP 서버가 `Content-Length` 기반 요청 본문을 받고 `POST` 엔드포인트로 라우팅하도록 확장한다. 본문 관련 오류(411, 413, 415, 501) 응답을 추가한다.
+- HTTP 서버가 `Content-Length` 기반 요청 본문을 받고 `POST` 엔드포인트로 라우팅하도록 확장한다. 본문 관련 오류(411, 413, 501) 응답을 추가한다.
 - 서버 실행 인자에 ICE용 UDP 포트(`--ice-port`)와, answer의 host candidate로 브라우저에 알려 줄 서버 주소(`--ice-address`)를 추가한다. 브라우저는 이 주소로 STUN 요청을 보낸다. 주소를 지정하지 않으면 서버의 네트워크 인터페이스 주소 중 루프백을 제외한 IPv4 주소를 모두 사용한다.
 - OpenSSL(C API)을 첫 외부 의존성으로 도입한다. HMAC-SHA1, 난수, 인증서 생성에 사용한다.
 - 웹 페이지에 연결 시작 버튼과 ICE·연결 상태 표시를 추가한다.
@@ -31,7 +31,7 @@
 
 ### Modified Capabilities
 
-- `http-server`: 요청 본문 수신과 `POST` 라우팅이 추가되어 요청 오류 응답(411, 413, 415, 501, 경로별 405 `Allow`)이 바뀐다.
+- `http-server`: 요청 본문 수신과 `POST` 라우팅이 추가되어 요청 오류 응답(411, 413, 501, 경로별 405 `Allow`)이 바뀐다.
 
 ## Impact
 
