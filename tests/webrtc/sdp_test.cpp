@@ -87,6 +87,7 @@ void TestInterpretsChromeOffer() {
 void TestFallsBackToFirstH264AndSessionCredentials() {
     const auto offer = ParseOffer(
         "v=0\r\na=ice-ufrag:sess\r\na=ice-pwd:sessionpassword\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n"
         "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\na=mid:v\r\n"
         "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=0;profile-level-id=42e01f\r\n"
         "a=rtpmap:97 h264/90000\r\na=fmtp:97 profile-level-id=4d001f; packetization-mode=1\r\n"
@@ -103,7 +104,10 @@ void TestFallsBackToFirstH264AndSessionCredentials() {
 
 // 비디오 없음, H.264 없음, ICE 자격 증명 없음, 형식 오류를 원인과 함께 거부하는지 검사한다.
 void TestRejectsUnsupportedOffers() {
-    const std::string credentials = "a=ice-ufrag:u\r\na=ice-pwd:p\r\n";
+    // 검사하려는 원인 외의 조건은 모두 갖추도록 fingerprint도 넣는다.
+    const std::string credentials =
+        "a=ice-ufrag:u\r\na=ice-pwd:p\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n";
     Expect(!ParseOffer("v=0\r\n" + credentials + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n"),
            "비디오 섹션이 없는 offer");
     Expect(!ParseOffer("v=0\r\n" + credentials +
@@ -123,6 +127,7 @@ void TestRejectsUnsupportedOffers() {
 void TestSelectsVideoInBundle() {
     const auto offer = ParseOffer(
         "v=0\r\na=group:BUNDLE 1\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n"
         "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n"
         "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n"
         "m=video 9 UDP/TLS/RTP/SAVPF 97\r\na=mid:1\r\n"
@@ -177,6 +182,7 @@ void TestBuildsAnswerWithRequiredLines() {
 void TestRejectsExtraSectionsInAnswer() {
     const auto offer = ParseOffer(
         "v=0\r\na=group:BUNDLE 0 1\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n"
         "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n"
         "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n"
         "m=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\na=mid:1\r\na=rtpmap:111 opus/48000/2\r\n");
@@ -197,7 +203,9 @@ void TestRejectsExtraSectionsInAnswer() {
 // offer에 BUNDLE 그룹이 없으면 answer에도 넣지 않고, 비디오 섹션에 mid가 없으면 거부하는지 검사한다.
 void TestFollowsOfferBundleAndRequiresMid() {
     const std::string without_bundle =
-        "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:v\r\n"
+        "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:v\r\n"
         "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n";
     const auto offer = ParseOffer(without_bundle);
     if (!offer) {
@@ -215,6 +223,86 @@ void TestFollowsOfferBundleAndRequiresMid() {
 }
 
 
+// fingerprint와 setup 시나리오에 쓸 offer를 만든다.
+//
+// session_lines: 세션 수준에 넣을 줄(ICE 자격 증명 뒤)
+// media_lines: 비디오 섹션의 a=mid 뒤에 넣을 줄
+// 반환값: 비디오 섹션 하나와 H.264를 갖춘 offer 원문
+std::string MakeOffer(std::string_view session_lines, std::string_view media_lines) {
+    return std::string("v=0\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n") + std::string(session_lines) +
+           "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n" + std::string(media_lines) +
+           "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n";
+}
+
+
+// Chrome offer 견본의 fingerprint를 읽고, 소문자 값을 대문자로 정규화하며, 미디어 수준을 우선하는지 검사한다.
+void TestInterpretsFingerprint() {
+    const auto chrome = ParseOffer(ReadChromeOffer());
+    Expect(chrome && chrome->remote_fingerprint ==
+                         "0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:"
+                         "5E:E1:DA:A8:FB:4E:50:71",
+           "견본 Chrome offer의 fingerprint");
+
+    const std::string lower_case =
+        "0e:6a:a6:4d:f1:a2:6f:95:9f:50:48:0e:6d:31:f5:bd:e5:79:d4:25:87:8b:53:45:5e:e1:da:a8:fb:4e:50:71";
+    const auto normalized = ParseOffer(MakeOffer("", "a=fingerprint:SHA-256 " + lower_case + "\r\n"));
+    Expect(normalized && normalized->remote_fingerprint ==
+                             "0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:"
+                             "45:5E:E1:DA:A8:FB:4E:50:71",
+           "소문자 값과 해시 이름을 대소문자 무시로 해석하고 대문자로 정규화");
+
+    const std::string session_value =
+        "11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11";
+    const std::string media_value =
+        "22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22:22";
+    const auto media_first =
+        ParseOffer(MakeOffer("a=fingerprint:sha-256 " + session_value + "\r\n",
+                             "a=fingerprint:sha-1 AA:BB\r\na=fingerprint:sha-256 " + media_value +
+                                 "\r\n"));
+    Expect(media_first && media_first->remote_fingerprint == media_value,
+           "미디어 수준의 첫 sha-256 줄을 우선");
+    const auto session_only =
+        ParseOffer(MakeOffer("a=fingerprint:sha-256 " + session_value + "\r\n", ""));
+    Expect(session_only && session_only->remote_fingerprint == session_value,
+           "미디어 수준에 없으면 세션 수준 값");
+}
+
+
+// fingerprint 없음, sha-1만 있음, 형식이 틀린 값, setup:passive를 거부하고 setup 기본값을 받아들이는지 검사한다.
+void TestRejectsInvalidFingerprintAndSetup() {
+    const std::string valid_fingerprint =
+        "a=fingerprint:sha-256 "
+        "0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71"
+        "\r\n";
+
+    Expect(!ParseOffer(MakeOffer("", "")), "fingerprint가 없는 offer");
+    Expect(!ParseOffer(MakeOffer("", "a=fingerprint:sha-1 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:"
+                                     "F5:BD:E5:79:D4:25\r\n")),
+           "sha-1 fingerprint만 있는 offer");
+    Expect(!ParseOffer(MakeOffer("", "a=fingerprint:sha-256 0E:6A:A6\r\n")), "짧은 fingerprint 값");
+    Expect(!ParseOffer(MakeOffer(
+               "", "a=fingerprint:sha-256 "
+                   "0E-6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:"
+                   "A8:FB:4E:50:71\r\n")),
+           "구분자가 틀린 fingerprint 값");
+    Expect(!ParseOffer(MakeOffer(
+               "", "a=fingerprint:sha-256 "
+                   "ZZ:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:"
+                   "A8:FB:4E:50:71\r\n")),
+           "16진수가 아닌 fingerprint 값");
+
+    Expect(!ParseOffer(MakeOffer("", valid_fingerprint + "a=setup:passive\r\n")),
+           "setup:passive offer");
+    Expect(!ParseOffer(MakeOffer("a=setup:passive\r\n", valid_fingerprint)),
+           "세션 수준 setup:passive offer");
+    Expect(ParseOffer(MakeOffer("", valid_fingerprint + "a=setup:actpass\r\n")).has_value(),
+           "setup:actpass offer");
+    Expect(ParseOffer(MakeOffer("", valid_fingerprint + "a=setup:active\r\n")).has_value(),
+           "setup:active offer");
+    Expect(ParseOffer(MakeOffer("", valid_fingerprint)).has_value(), "setup이 없으면 active로 봄");
+}
+
+
 }  // namespace
 
 
@@ -226,5 +314,7 @@ int main() {
     TestBuildsAnswerWithRequiredLines();
     TestRejectsExtraSectionsInAnswer();
     TestFollowsOfferBundleAndRequiresMid();
+    TestInterpretsFingerprint();
+    TestRejectsInvalidFingerprintAndSetup();
     return vms::test::ExitCode();
 }

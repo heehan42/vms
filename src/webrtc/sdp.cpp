@@ -21,6 +21,10 @@ constexpr std::string_view kSecureRtpProtocol = "UDP/TLS/RTP/SAVPF";
 constexpr std::string_view kPreferredH264Profile = "42e01f";
 
 
+// SHA-256 fingerprint의 바이트 수. 값은 16진수 두 자리씩 ':'로 구분한 이 수만큼의 쌍이다.
+constexpr std::size_t kSha256FingerprintBytes = 32;
+
+
 // 문자열을 공백 기준으로 나눈다. 연속된 공백은 하나로 본다.
 //
 // text: 나눌 문자열
@@ -68,6 +72,55 @@ std::optional<std::string_view> FindIceCredential(const SdpSessionDescription& d
         return std::nullopt;
     }
     return value;
+}
+
+
+// a=fingerprint 줄 중 해시가 sha-256인 첫 줄의 값을 찾는다. 해시 이름은 대소문자를 무시한다.
+//
+// attributes: 찾을 속성 목록
+// 반환값: 해시 이름 뒤의 fingerprint 값. 없으면 빈 optional. attributes가 살아 있는 동안에만 유효하다.
+std::optional<std::string_view> FindSha256Fingerprint(std::span<const SdpAttribute> attributes) {
+    for (const SdpAttribute& attribute : attributes) {
+        if (attribute.name != "fingerprint") {
+            continue;
+        }
+        const auto tokens = SplitBySpace(attribute.value);
+        if (tokens.size() == 2 && core::EqualsIgnoringAsciiCase(tokens[0], "sha-256")) {
+            return tokens[1];
+        }
+    }
+    return std::nullopt;
+}
+
+
+// fingerprint 값의 형식을 확인하고 대문자로 정규화한다.
+//
+// value: "ab:CD:..." 형식의 값
+// 반환값: 대문자로 바꾼 값. 16진수 32쌍을 ':'로 구분한 형식이 아니면 빈 optional
+std::optional<std::string> NormalizeSha256Fingerprint(std::string_view value) {
+    if (value.size() != kSha256FingerprintBytes * 3 - 1) {
+        return std::nullopt;
+    }
+
+    std::string normalized(value);
+    for (std::size_t index = 0; index < normalized.size(); ++index) {
+        char& character = normalized[index];
+        if (index % 3 == 2) {
+            if (character != ':') {
+                return std::nullopt;
+            }
+            continue;
+        }
+        if (character >= 'a' && character <= 'f') {
+            character = static_cast<char>(character - 'a' + 'A');
+        }
+        const bool is_upper_hex =
+            (character >= '0' && character <= '9') || (character >= 'A' && character <= 'F');
+        if (!is_upper_hex) {
+            return std::nullopt;
+        }
+    }
+    return normalized;
 }
 
 
@@ -281,6 +334,28 @@ std::expected<SdpOffer, std::string> InterpretOffer(const SdpSessionDescription&
     if (!ice_ufrag || !ice_pwd) {
         return std::unexpected("ICE ufrag 또는 pwd가 없음");
     }
+
+    auto fingerprint_value = FindSha256Fingerprint(video.attributes);
+    if (!fingerprint_value) {
+        fingerprint_value = FindSha256Fingerprint(description.session_attributes);
+    }
+    if (!fingerprint_value) {
+        return std::unexpected("sha-256 fingerprint가 없음");
+    }
+    auto remote_fingerprint = NormalizeSha256Fingerprint(*fingerprint_value);
+    if (!remote_fingerprint) {
+        return std::unexpected(std::format("sha-256 fingerprint 형식이 아님: {}", *fingerprint_value));
+    }
+
+    // 서버가 answer에서 passive(DTLS 서버)를 맡으므로, 브라우저는 DTLS 클라이언트가 될 수 있어야 한다.
+    auto setup = FindAttribute(video.attributes, "setup");
+    if (!setup) {
+        setup = FindAttribute(description.session_attributes, "setup");
+    }
+    if (setup && *setup != "actpass" && *setup != "active") {
+        return std::unexpected(std::format("지원하지 않는 DTLS 역할: setup:{}", *setup));
+    }
+
     auto h264 = SelectH264Codec(video);
     if (!h264) {
         return std::unexpected("packetization-mode=1인 H.264가 없음");
@@ -291,6 +366,7 @@ std::expected<SdpOffer, std::string> InterpretOffer(const SdpSessionDescription&
     offer.has_bundle_group = bundle_mids.has_value();
     offer.ice_ufrag = *ice_ufrag;
     offer.ice_pwd = *ice_pwd;
+    offer.remote_fingerprint = *std::move(remote_fingerprint);
     offer.h264 = *std::move(h264);
     for (std::size_t index = 0; index < description.media_sections.size(); ++index) {
         const SdpMediaSection& section = description.media_sections[index];

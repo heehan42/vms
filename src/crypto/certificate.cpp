@@ -53,10 +53,9 @@ bool SetSelfSignedName(X509* certificate) {
 }
 
 
-// 인증서의 SHA-256 fingerprint를 SDP 형식 문자열로 만든다.
-//
-// certificate: fingerprint를 계산할 인증서
-// 반환값: "AB:CD:..." 형식 문자열. 계산에 실패하면 오류 메시지
+}  // namespace
+
+
 std::expected<std::string, std::string> ComputeSha256Fingerprint(const X509* certificate) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
     unsigned int digest_size = 0;
@@ -73,9 +72,6 @@ std::expected<std::string, std::string> ComputeSha256Fingerprint(const X509* cer
     }
     return fingerprint;
 }
-
-
-}  // namespace
 
 
 std::expected<Certificate, std::string> Certificate::Generate() {

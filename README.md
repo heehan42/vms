@@ -2,14 +2,16 @@
 
 카메라 영상과 저장된 동영상을 관리하고 재생하는 VMS(Video Management System)입니다.
 먼저 서버의 동영상 파일을 웹 사이트에서 WebRTC로 재생하는 기능부터 구현하고 있으며,
-현재는 웹 페이지를 제공하는 HTTP 서버와, 브라우저와 ICE 연결을 맺는 시그널링·ICE-lite까지 구현되어 있습니다.
-DTLS와 미디어 송신은 아직 없습니다.
+현재는 웹 페이지를 제공하는 HTTP 서버, 브라우저와 ICE 연결을 맺는 시그널링·ICE-lite, 그리고 그 연결 위에서
+SRTP 키를 정하는 DTLS 핸드셰이크까지 구현되어 있습니다. 미디어(SRTP) 송신은 아직 없습니다.
 
 ## 필요한 도구
 
 - CMake 3.28 이상
 - C++23의 `<print>`, `std::expected`, `std::move_only_function`을 지원하는 컴파일러 (GCC 14 이상)
-- OpenSSL 3.x 개발 패키지. Ubuntu에서는 다음과 같이 설치합니다.
+- OpenSSL 3.2 이상 개발 패키지(`libssl`, `libcrypto`). DTLS 데이터그램 처리에 3.2부터 들어간 datagram pair BIO를 씁니다.
+  Ubuntu 24.04의 기본 패키지는 3.0이므로 빌드할 수 없습니다. 버전이 낮으면 `cmake -B build` 단계에서 오류가 납니다.
+  Ubuntu에서는 다음과 같이 설치합니다.
 
   ```bash
   sudo apt install libssl-dev
@@ -27,7 +29,7 @@ cmake --build build -j
 ## 실행
 
 저장소 루트에서 실행하면 `./web` 디렉터리의 파일을 8080 포트로 제공하고,
-ICE 연결 확인(STUN)을 UDP 50000 포트에서 받습니다.
+ICE 연결 확인(STUN)과 DTLS를 UDP 50000 포트에서 받습니다.
 
 ```bash
 ./build/vms_web_server
@@ -74,7 +76,25 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
    "app.js가 실행되었습니다." 문구가 보이면 페이지와 스크립트가 정상적으로 전달된 것입니다.
 2. **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
    서버 로그에는 `ICE 연결됨: ...`이 남습니다.
-3. 아직 DTLS를 구현하지 않았으므로 연결 상태(`connectionState`)는 잠시 뒤 `failed`가 됩니다. 정상입니다.
+3. 이어서 DTLS 핸드셰이크가 끝나면 연결 상태(`connectionState`)가 `connected`가 되고,
+   페이지에 DTLS 상태 `connected`와 SRTP 암호 `SRTP_AES128_CM_HMAC_SHA1_80`이 표시됩니다.
+   서버 로그에는 `DTLS 연결됨: ..., SRTP 프로파일 SRTP_AES128_CM_SHA1_80`이 남습니다.
+4. `chrome://webrtc-internals`의 transport 통계에서도 확인할 수 있습니다.
+
+   | 항목 | 기대값 | 의미 |
+   |---|---|---|
+   | `dtlsState` | `connected` | DTLS 핸드셰이크 완료 |
+   | `dtlsRole` | `client` | 서버가 answer에서 `a=setup:passive`로 DTLS 서버를 맡으므로 브라우저는 클라이언트 |
+   | `srtpCipher` | `SRTP_AES128_CM_HMAC_SHA1_80` | 협상한 SRTP 프로파일 |
+
+서버는 offer의 `a=fingerprint:sha-256` 값과 핸드셰이크에서 받은 브라우저 인증서를 비교하므로,
+offer에 `sha-256` fingerprint가 없거나 `a=setup`이 `actpass`·`active`가 아니면 `400`으로 거부합니다.
+
+### 세션 만료
+
+ICE 세션은 만든 뒤, 또는 마지막 유효 Binding 요청 뒤 30초 동안 유효한 요청이 없으면 그 DTLS 상태와 함께 제거됩니다.
+연결된 브라우저는 몇 초마다 동의 확인(consent) 요청을 보내므로 연결을 유지하는 동안에는 만료되지 않습니다.
+탭을 닫거나 연결 버튼을 다시 눌러 이전 연결이 닫히면 약 30초 뒤 서버 로그에 `ICE 세션 제거: ...`가 남습니다.
 
 연결이 되지 않으면 Chrome에서 `chrome://webrtc-internals`를 **먼저** 열어 둔 뒤 다시 연결해 봅니다.
 

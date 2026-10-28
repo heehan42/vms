@@ -48,7 +48,7 @@
 
 #### Scenario: Chrome에서의 확인
 - **WHEN** Chrome과 핸드셰이크가 끝난 뒤 `chrome://webrtc-internals`의 transport 통계를 본다
-- **THEN** `dtlsState`는 `connected`, `dtlsRole`은 `client`, `srtpCipher`는 `AES_CM_128_HMAC_SHA1_80`이다
+- **THEN** `dtlsState`는 `connected`, `dtlsRole`은 `client`, `srtpCipher`는 `SRTP_AES128_CM_HMAC_SHA1_80`이다
 
 #### Scenario: SRTP 미제안
 - **WHEN** `use_srtp` 확장 없이 ClientHello를 보낸 클라이언트가 핸드셰이크한다

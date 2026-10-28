@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <format>
+#include <functional>
 #include <print>
 #include <utility>
 
@@ -59,7 +60,7 @@ enum class PacketKind {
     // ICE 연결 확인 메시지. 첫 바이트 0~3
     kStun,
 
-    // DTLS 레코드. 첫 바이트 20~63. 이후 마일스톤에서 핸드셰이크에 쓴다.
+    // DTLS 레코드. 첫 바이트 20~63
     kDtls,
 
     // RTP 또는 RTCP. 첫 바이트 128~191
@@ -160,8 +161,15 @@ std::expected<core::UniqueFd, std::error_code> OpenUdpSocket(in_addr address, st
 }  // namespace
 
 
+std::size_t IceLiteAgent::NominatedPairKeyHash::operator()(const NominatedPairKey& key) const {
+    const std::uint64_t endpoint =
+        (static_cast<std::uint64_t>(key.remote_address) << 16) | key.remote_port;
+    return std::hash<std::uint64_t>{}(endpoint) ^ (std::hash<std::size_t>{}(key.socket_index) << 1);
+}
+
+
 std::expected<std::unique_ptr<IceLiteAgent>, std::string> IceLiteAgent::Start(
-    core::EventLoop& loop, IceLiteAgentConfig config) {
+    core::EventLoop& loop, IceLiteAgentConfig config, const crypto::DtlsContext& dtls_context) {
     if (config.addresses.empty()) {
         return std::unexpected("ICE 주소가 하나도 없습니다");
     }
@@ -181,7 +189,8 @@ std::expected<std::unique_ptr<IceLiteAgent>, std::string> IceLiteAgent::Start(
 
     // 핸들러가 에이전트 주소를 캡처하므로, 주소가 고정되는 힙 객체를 만든 뒤 등록한다.
     // 등록 도중 실패하면 소멸자가 이미 등록한 소켓만 해제한다.
-    std::unique_ptr<IceLiteAgent> agent(new IceLiteAgent(loop, std::move(sockets)));
+    std::unique_ptr<IceLiteAgent> agent(
+        new IceLiteAgent(loop, std::move(sockets), config.session_timeout, dtls_context));
     for (std::size_t index = 0; index < agent->sockets_.size(); ++index) {
         IceLiteAgent* const agent_address = agent.get();
         const std::error_code add_error =
@@ -197,8 +206,13 @@ std::expected<std::unique_ptr<IceLiteAgent>, std::string> IceLiteAgent::Start(
 }
 
 
-IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets)
-    : loop_(loop), sockets_(std::move(sockets)) {
+IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets,
+                           std::chrono::milliseconds session_timeout,
+                           const crypto::DtlsContext& dtls_context)
+    : loop_(loop),
+      dtls_context_(dtls_context),
+      session_timeout_(session_timeout),
+      sockets_(std::move(sockets)) {
     for (std::size_t index = 0; index < sockets_.size(); ++index) {
         const sockaddr_in& endpoint = sockets_[index].local_endpoint;
         candidates_.push_back(IceCandidate{
@@ -212,6 +226,12 @@ IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> socke
 
 
 IceLiteAgent::~IceLiteAgent() {
+    // 루프보다 먼저 소멸하므로, 소멸한 에이전트를 가리키는 타이머 핸들러가 실행되지 않게 모두 취소한다.
+    for (const auto& [local_ufrag, session] : sessions_) {
+        loop_.CancelTimer(session.retransmission_timer_id);
+        loop_.CancelTimer(session.expiry_timer_id);
+    }
+
     // 등록되지 않은 fd의 Remove는 아무것도 하지 않으므로, 등록 도중 실패한 경우에도 안전하다.
     for (const BoundSocket& bound : sockets_) {
         loop_.Remove(bound.socket.Get());
@@ -220,7 +240,7 @@ IceLiteAgent::~IceLiteAgent() {
 
 
 std::expected<IceCredentials, std::string> IceLiteAgent::CreateSession(
-    std::string_view remote_ufrag) {
+    std::string_view remote_ufrag, std::string_view remote_fingerprint) {
     std::string local_ufrag;
     do {
         auto generated = crypto::GenerateIceCharString(kLocalUfragLength);
@@ -235,10 +255,13 @@ std::expected<IceCredentials, std::string> IceLiteAgent::CreateSession(
         return std::unexpected(local_pwd.error());
     }
 
-    sessions_.emplace(local_ufrag, Session{.local_pwd = *local_pwd,
-                                           .remote_ufrag = std::string(remote_ufrag),
-                                           .state = IceSessionState::kWaitingForCheck,
-                                           .nominated_pair = std::nullopt});
+    Session session;
+    session.local_pwd = *local_pwd;
+    session.remote_ufrag = remote_ufrag;
+    session.remote_fingerprint = remote_fingerprint;
+    session.last_activity_time = std::chrono::steady_clock::now();
+    session.expiry_timer_id = ScheduleExpiryCheck(local_ufrag, session_timeout_);
+    sessions_.emplace(local_ufrag, std::move(session));
     return IceCredentials{.ice_ufrag = std::move(local_ufrag), .ice_pwd = *std::move(local_pwd)};
 }
 
@@ -290,14 +313,25 @@ void IceLiteAgent::HandlePacket(std::size_t socket_index, std::span<const std::u
         HandleStunPacket(socket_index, packet, remote_endpoint);
         return;
     }
+    if (kind == PacketKind::kDtls) {
+        HandleDtlsPacket(socket_index, packet, remote_endpoint);
+        return;
+    }
 
-    // DTLS·RTP는 아직 처리하지 않는다. 브라우저가 재전송하므로 주소마다 처음 한 번만 기록한다.
+    // RTP와 알 수 없는 패킷은 아직 처리하지 않는다.
+    LogDroppedPacket(PacketKindName(kind), socket_index, remote_endpoint);
+}
+
+
+void IceLiteAgent::LogDroppedPacket(std::string_view protocol_name, std::size_t socket_index,
+                                    const sockaddr_in& remote_endpoint) {
+    // 브라우저가 재전송하므로 주소마다 처음 한 번만 기록한다.
     if (logged_non_stun_endpoints_.size() >= kMaxLoggedNonStunEndpoints) {
         logged_non_stun_endpoints_.clear();
     }
     if (logged_non_stun_endpoints_.insert(EndpointKey(remote_endpoint)).second) {
         std::println(stderr, "{} 패킷 버림 ({} -> {}), 같은 주소의 이후 패킷은 기록하지 않음",
-                     PacketKindName(kind), core::FormatIpv4Endpoint(remote_endpoint),
+                     protocol_name, core::FormatIpv4Endpoint(remote_endpoint),
                      core::FormatIpv4Endpoint(sockets_[socket_index].local_endpoint));
     }
 }
@@ -352,6 +386,8 @@ void IceLiteAgent::HandleStunPacket(std::size_t socket_index, std::span<const st
         reject(StunErrorDescription(integrity.error()));
         return;
     }
+    // 서명까지 확인한 요청만 세션을 살려 둔다. 동의 확인 요청도 여기에 해당한다.
+    session.last_activity_time = std::chrono::steady_clock::now();
 
     const auto response =
         BuildBindingSuccessResponse(message->transaction_id, remote_endpoint, session.local_pwd);
@@ -369,14 +405,174 @@ void IceLiteAgent::HandleStunPacket(std::size_t socket_index, std::span<const st
         return;
     }
 
-    // 동의 확인 요청에도 계속 응답하지만, 연결 수립은 처음 지명될 때만 기록한다.
+    // 동의 확인 요청에도 계속 응답하지만, 연결 수립은 처음 nomination을 받을 때만 기록한다.
+    // 다른 pair의 nomination 변경에는 성공 응답만 보내고 DTLS 경로는 바꾸지 않는다.
     if (message->has_use_candidate && session.state == IceSessionState::kWaitingForCheck) {
-        session.state = IceSessionState::kConnected;
-        session.nominated_pair =
-            NominatedPair{.socket_index = socket_index, .remote_endpoint = remote_endpoint};
-        std::println(stderr, "ICE 연결됨: 세션 {}, 브라우저 {} <-> 서버 {}", found->first,
-                     remote_text, core::FormatIpv4Endpoint(bound.local_endpoint));
+        RecordNomination(found, socket_index, remote_endpoint);
     }
+}
+
+
+void IceLiteAgent::RecordNomination(SessionIterator session, std::size_t socket_index,
+                                    const sockaddr_in& remote_endpoint) {
+    const std::string& local_ufrag = session->first;
+    const std::string remote_text = core::FormatIpv4Endpoint(remote_endpoint);
+    session->second.state = IceSessionState::kConnected;
+    session->second.nominated_pair =
+        NominatedPair{.socket_index = socket_index, .remote_endpoint = remote_endpoint};
+    std::println(stderr, "ICE 연결됨: 세션 {}, 브라우저 {} <-> 서버 {}", local_ufrag, remote_text,
+                 core::FormatIpv4Endpoint(sockets_[socket_index].local_endpoint));
+
+    // ClientHello가 오기 전에 미리 만들어, nominated pair 테이블에 있는 세션은 항상
+    // DtlsTransport를 가지게 한다.
+    auto transport = DtlsTransport::Create(dtls_context_, session->second.remote_fingerprint);
+    if (!transport) {
+        std::println(stderr, "DTLS 상태 생성 실패: 세션 {}, 브라우저 {}: {}. 이 세션의 DTLS 패킷은 버림",
+                     local_ufrag, remote_text, transport.error());
+        return;
+    }
+    session->second.dtls_transport = *std::move(transport);
+
+    // 같은 pair를 쓰던 이전 세션이 있으면 새 세션으로 바꾼다. 이전 세션을 제거할 때는 값이 자기 ufrag인
+    // 항목만 지우므로 새 세션의 항목은 남는다.
+    const NominatedPairKey key{.socket_index = socket_index,
+                               .remote_address = remote_endpoint.sin_addr.s_addr,
+                               .remote_port = remote_endpoint.sin_port};
+    nominated_pairs_.insert_or_assign(key, local_ufrag);
+}
+
+
+void IceLiteAgent::HandleDtlsPacket(std::size_t socket_index, std::span<const std::uint8_t> packet,
+                                    const sockaddr_in& remote_endpoint) {
+    const NominatedPairKey key{.socket_index = socket_index,
+                               .remote_address = remote_endpoint.sin_addr.s_addr,
+                               .remote_port = remote_endpoint.sin_port};
+    const auto pair = nominated_pairs_.find(key);
+    if (pair == nominated_pairs_.end()) {
+        LogDroppedPacket("DTLS", socket_index, remote_endpoint);
+        return;
+    }
+
+    // nominated pair 테이블의 항목은 세션을 제거할 때 함께 지우므로 세션은 항상 있다.
+    const auto session = sessions_.find(pair->second);
+    DtlsTransport& transport = *session->second.dtls_transport;
+    const DtlsState previous_state = transport.State();
+    if (previous_state == DtlsState::kFailed || previous_state == DtlsState::kClosed) {
+        return;
+    }
+    FinishDtlsStep(session, transport.HandleDatagram(packet), previous_state);
+}
+
+
+void IceLiteAgent::HandleRetransmissionTimeout(const std::string& local_ufrag) {
+    const auto session = sessions_.find(local_ufrag);
+    if (session == sessions_.end()) {
+        return;
+    }
+
+    // 이미 실행된 타이머이므로 ID를 지워 다시 취소하지 않게 한다.
+    session->second.retransmission_timer_id = 0;
+    DtlsTransport& transport = *session->second.dtls_transport;
+    const DtlsState previous_state = transport.State();
+    FinishDtlsStep(session, transport.HandleTimeout(), previous_state);
+}
+
+
+void IceLiteAgent::FinishDtlsStep(SessionIterator session, const std::vector<Datagram>& datagrams,
+                                  DtlsState previous_state) {
+    const std::string& local_ufrag = session->first;
+    Session& state = session->second;
+    const NominatedPair& pair = *state.nominated_pair;
+    const std::string remote_text = core::FormatIpv4Endpoint(pair.remote_endpoint);
+
+    // nominated pair의 소켓에서 보내야 출발 주소가 브라우저가 보낸 목적지와 같아진다.
+    for (const Datagram& datagram : datagrams) {
+        const ssize_t sent_size =
+            ::sendto(sockets_[pair.socket_index].socket.Get(), datagram.data(), datagram.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&pair.remote_endpoint),
+                     sizeof(pair.remote_endpoint));
+        if (sent_size < 0) {
+            std::println(stderr, "DTLS 송신 실패 ({}): {}", remote_text,
+                         core::LastSystemError().message());
+        }
+    }
+
+    // 핸드셰이크가 끝나거나 실패하면 NextTimeout()이 비어 타이머를 더 걸지 않는다.
+    DtlsTransport& transport = *state.dtls_transport;
+    loop_.CancelTimer(state.retransmission_timer_id);
+    state.retransmission_timer_id = 0;
+    if (const auto timeout = transport.NextTimeout()) {
+        state.retransmission_timer_id =
+            loop_.AddTimer(*timeout, [this, local_ufrag] { HandleRetransmissionTimeout(local_ufrag); });
+    }
+
+    const DtlsState current_state = transport.State();
+    if (current_state == previous_state) {
+        return;
+    }
+    switch (current_state) {
+        case DtlsState::kConnected:
+            std::println(stderr, "DTLS 연결됨: 세션 {}, 브라우저 {}, SRTP 프로파일 {}", local_ufrag,
+                         remote_text, transport.SelectedSrtpProfileName());
+            break;
+        case DtlsState::kFailed:
+            std::println(stderr, "DTLS 실패: 세션 {}, 브라우저 {}: {}", local_ufrag, remote_text,
+                         transport.FailureReason());
+            break;
+        case DtlsState::kClosed:
+            std::println(stderr, "DTLS 닫힘: 세션 {}, 브라우저 {}", local_ufrag, remote_text);
+            break;
+        case DtlsState::kHandshaking:
+            break;
+    }
+}
+
+
+core::EventLoop::TimerId IceLiteAgent::ScheduleExpiryCheck(const std::string& local_ufrag,
+                                                           std::chrono::milliseconds delay) {
+    return loop_.AddTimer(delay, [this, local_ufrag] { HandleExpiryTimeout(local_ufrag); });
+}
+
+
+void IceLiteAgent::HandleExpiryTimeout(const std::string& local_ufrag) {
+    const auto session = sessions_.find(local_ufrag);
+    if (session == sessions_.end()) {
+        return;
+    }
+
+    const auto expires_at = session->second.last_activity_time + session_timeout_;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= expires_at) {
+        RemoveSession(session);
+        return;
+    }
+    session->second.expiry_timer_id = ScheduleExpiryCheck(
+        local_ufrag, std::chrono::ceil<std::chrono::milliseconds>(expires_at - now));
+}
+
+
+void IceLiteAgent::RemoveSession(SessionIterator session) {
+    const std::string& local_ufrag = session->first;
+    Session& state = session->second;
+    loop_.CancelTimer(state.retransmission_timer_id);
+    loop_.CancelTimer(state.expiry_timer_id);
+
+    std::string remote_text = "없음";
+    if (state.nominated_pair) {
+        const NominatedPair& pair = *state.nominated_pair;
+        remote_text = core::FormatIpv4Endpoint(pair.remote_endpoint);
+        const auto entry = nominated_pairs_.find(
+            NominatedPairKey{.socket_index = pair.socket_index,
+                             .remote_address = pair.remote_endpoint.sin_addr.s_addr,
+                             .remote_port = pair.remote_endpoint.sin_port});
+        if (entry != nominated_pairs_.end() && entry->second == local_ufrag) {
+            nominated_pairs_.erase(entry);
+        }
+    }
+
+    std::println(stderr, "ICE 세션 제거: 세션 {}, 브라우저 {}, {}ms 동안 유효한 요청 없음", local_ufrag,
+                 remote_text, session_timeout_.count());
+    sessions_.erase(session);
 }
 
 

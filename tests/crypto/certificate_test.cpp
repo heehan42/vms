@@ -5,6 +5,7 @@
 #include "test_support.h"
 
 using vms::crypto::Certificate;
+using vms::crypto::ComputeSha256Fingerprint;
 using vms::test::Expect;
 
 
@@ -55,11 +56,27 @@ void TestGeneratesDifferentCertificates() {
 }
 
 
+// 접근자로 꺼낸 인증서의 fingerprint를 다시 계산하면 보관한 값과 같은지, 키가 인증서와 짝인지 검사한다.
+void TestAccessorsMatchStoredFingerprint() {
+    const auto certificate = Certificate::Generate();
+    if (!certificate) {
+        Expect(false, "인증서 생성이 성공해야 한다: " + certificate.error());
+        return;
+    }
+    const auto recomputed = ComputeSha256Fingerprint(certificate->X509Certificate());
+    Expect(recomputed && *recomputed == certificate->Sha256Fingerprint(),
+           "같은 인증서는 두 경로의 fingerprint가 같아야 한다");
+    Expect(::X509_check_private_key(certificate->X509Certificate(), certificate->PrivateKey()) == 1,
+           "개인 키가 인증서의 공개 키와 짝이어야 한다");
+}
+
+
 }  // namespace
 
 
 int main() {
     TestGeneratesFingerprint();
     TestGeneratesDifferentCertificates();
+    TestAccessorsMatchStoredFingerprint();
     return vms::test::ExitCode();
 }

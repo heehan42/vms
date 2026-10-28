@@ -32,7 +32,8 @@ public:
     // 반환값: 처리 결과
     //   - 200, application/sdp, answer: 세션을 만들고 answer를 생성함
     //   - 415: Content-Type이 application/sdp가 아님
-    //   - 400: SDP 형식이 잘못되었거나 협상할 비디오·H.264·ICE 자격 증명이 없음(원인을 로그에 남김)
+    //   - 400: SDP 형식이 잘못되었거나 협상할 비디오·H.264·ICE 자격 증명·sha-256 fingerprint가 없거나,
+    //     a=setup이 actpass·active가 아님(원인을 로그에 남김)
     //   - 500: 난수 생성 실패(원인을 로그에 남김)
     http::HttpEndpointResponse HandleOffer(const http::HttpRequest& request, std::string_view body);
 

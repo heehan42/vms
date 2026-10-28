@@ -26,7 +26,7 @@ enum class AttributeType : std::uint16_t {
     // 요청을 보낸 쪽의 주소와 포트를 magic cookie와 XOR한 값. 성공 응답에 넣는다.
     kXorMappedAddress = 0x0020,
 
-    // 브라우저가 이 candidate 쌍을 지명한다는 표시. 값이 없다.
+    // 브라우저가 이 candidate pair를 nomination한다는 표시. 값이 없다.
     kUseCandidate = 0x0025,
 
     // CRC-32 XOR 0x5354554E(4바이트). STUN 메시지인지 확인하며 항상 마지막 속성이다.

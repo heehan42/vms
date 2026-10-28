@@ -69,7 +69,7 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     }
 
     const auto session_id = GenerateSessionId();
-    auto credentials = session_id ? agent_.CreateSession(offer->ice_ufrag)
+    auto credentials = session_id ? agent_.CreateSession(offer->ice_ufrag, offer->remote_fingerprint)
                                   : std::expected<IceCredentials, std::string>(
                                         std::unexpected(session_id.error()));
     if (!credentials) {

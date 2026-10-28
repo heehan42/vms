@@ -15,7 +15,9 @@
 #include "core/network_interfaces.h"
 #include "core/termination_signal_watcher.h"
 #include "crypto/certificate.h"
+#include "crypto/dtls_context.h"
 #include "http/http_server.h"
+#include "webrtc/dtls_transport.h"
 #include "webrtc/ice_lite_agent.h"
 #include "webrtc/signaling.h"
 
@@ -24,9 +26,11 @@ namespace fs = std::filesystem;
 using vms::core::EventLoop;
 using vms::core::TerminationSignalWatcher;
 using vms::crypto::Certificate;
+using vms::crypto::DtlsContext;
 using vms::http::HttpRequest;
 using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
+using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
 using vms::webrtc::Signaling;
@@ -203,8 +207,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // 모든 세션의 DTLS 핸드셰이크가 이 인증서로 서버를 인증하고, 브라우저 인증서는 offer의
+    // fingerprint와 비교한다. 에이전트가 참조하므로 에이전트보다 먼저 만들어 나중에 소멸하게 한다.
+    auto dtls_context = DtlsContext::Create(*certificate, DtlsTransport::VerifyPeerCertificate);
+    if (!dtls_context) {
+        std::println(stderr, "DTLS 컨텍스트 생성 실패: {}", dtls_context.error());
+        return 1;
+    }
+
     auto ice_agent = IceLiteAgent::Start(
-        *loop, IceLiteAgentConfig{.addresses = *std::move(ice_addresses), .port = options->ice_port});
+        *loop, IceLiteAgentConfig{.addresses = *std::move(ice_addresses), .port = options->ice_port},
+        *dtls_context);
     if (!ice_agent) {
         std::println(stderr, "ICE 시작 실패: {}", ice_agent.error());
         return 1;

@@ -4,8 +4,10 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "core/unique_fd.h"
 #include "test_support.h"
@@ -13,6 +15,8 @@
 using vms::core::EventLoop;
 using vms::core::UniqueFd;
 using vms::test::Expect;
+
+using namespace std::chrono_literals;
 
 
 namespace {
@@ -168,6 +172,114 @@ void TestModifyChangesWatchedEvents() {
 }
 
 
+// 타이머가 기한 순서대로 실행되고, 기한이 같으면 등록 순서대로 실행되는지 검사한다.
+void TestTimersRunInDeadlineOrder() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+
+    std::vector<int> run_order;
+    loop->AddTimer(30ms, [&] {
+        run_order.push_back(3);
+        loop->Stop();
+    });
+    loop->AddTimer(10ms, [&] { run_order.push_back(1); });
+    loop->AddTimer(0ms, [&] { run_order.push_back(0); });
+    // 같은 기한을 만들려고 음수 지연을 쓴다. 둘 다 이미 지났으므로 등록 순서대로 실행되어야 한다.
+    loop->AddTimer(-1000ms, [&] { run_order.push_back(-2); });
+    loop->AddTimer(-1000ms, [&] { run_order.push_back(-1); });
+
+    const auto started_at = std::chrono::steady_clock::now();
+    Expect(!loop->Run(), "Stop 후 Run이 오류 없이 반환되어야 한다");
+    Expect(std::chrono::steady_clock::now() - started_at >= 30ms, "가장 늦은 기한까지 기다려야 한다");
+    Expect(run_order == std::vector<int>{-2, -1, 0, 1, 3}, "기한 순서, 같은 기한은 등록 순서");
+}
+
+
+// 취소한 타이머는 실행되지 않고, 없는 ID의 취소는 무시되는지 검사한다.
+void TestCancelledTimerDoesNotRun() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+
+    bool is_cancelled_timer_run = false;
+    const EventLoop::TimerId cancelled = loop->AddTimer(5ms, [&] { is_cancelled_timer_run = true; });
+    loop->AddTimer(20ms, [&] { loop->Stop(); });
+    loop->CancelTimer(cancelled);
+    loop->CancelTimer(cancelled);
+    loop->CancelTimer(9999);
+
+    loop->Run();
+    Expect(!is_cancelled_timer_run, "취소한 타이머는 실행되지 않아야 한다");
+}
+
+
+// 핸들러 안에서 자기 자신을 취소해도 안전하고, 새로 등록한 0초 타이머는 다음 반복에 실행되는지 검사한다.
+void TestTimerHandlerCanCancelSelfAndAddTimer() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+    UniqueFd event_fd = CreateEventFd();
+
+    // 0초 타이머가 같은 반복에서 실행되면 fd 핸들러보다 먼저 기록된다.
+    std::vector<std::string> run_order;
+    EventLoop::TimerId self_id = 0;
+    self_id = loop->AddTimer(0ms, [&] {
+        run_order.push_back("first");
+        loop->CancelTimer(self_id);
+        Signal(event_fd);
+        loop->AddTimer(0ms, [&] {
+            run_order.push_back("second");
+            loop->Stop();
+        });
+    });
+    loop->Add(event_fd.Get(), EPOLLIN, [&](std::uint32_t) {
+        run_order.push_back("fd");
+        Drain(event_fd);
+    });
+
+    loop->Run();
+    Expect(run_order == std::vector<std::string>{"first", "fd", "second"},
+           "새 0초 타이머는 다음 반복에서 fd 이벤트 뒤에 실행되어야 한다");
+    loop->Remove(event_fd.Get());
+}
+
+
+// 타이머를 기다리는 동안 fd 이벤트도 처리하는지 검사한다.
+void TestTimersAndFdEventsTogether() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+    UniqueFd event_fd = CreateEventFd();
+
+    int fd_event_count = 0;
+    bool is_timer_run = false;
+    loop->Add(event_fd.Get(), EPOLLIN, [&](std::uint32_t) {
+        ++fd_event_count;
+        Drain(event_fd);
+    });
+    loop->AddTimer(10ms, [&] { Signal(event_fd); });
+    loop->AddTimer(40ms, [&] {
+        is_timer_run = true;
+        loop->Stop();
+    });
+    Signal(event_fd);
+
+    loop->Run();
+    Expect(fd_event_count == 2, "타이머 대기 중과 타이머가 일으킨 fd 이벤트를 모두 처리해야 한다");
+    Expect(is_timer_run, "fd 이벤트 뒤에도 타이머가 실행되어야 한다");
+    loop->Remove(event_fd.Get());
+}
+
+
 }  // namespace
 
 
@@ -177,5 +289,9 @@ int main() {
     TestRemovedHandlerIsSkippedInSameBatch();
     TestHandlerCanRemoveItself();
     TestModifyChangesWatchedEvents();
+    TestTimersRunInDeadlineOrder();
+    TestCancelledTimerDoesNotRun();
+    TestTimerHandlerCanCancelSelfAndAddTimer();
+    TestTimersAndFdEventsTogether();
     return vms::test::ExitCode();
 }

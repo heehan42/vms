@@ -146,6 +146,11 @@ expect_equal "answer마다 같은 fingerprint" "$(grep '^a=fingerprint:' <<< "${
 expect_equal "offer Content-Type 오류" "415" \
     "$(status_of /offer --data-binary "@${chrome_offer}" -H 'Content-Type: text/plain')"
 expect_equal "SDP가 아닌 offer" "400" "$(status_of /offer --data-binary hello "${sdp_header[@]}")"
+expect_equal "fingerprint 없는 offer" "400" \
+    "$(grep -v '^a=fingerprint:' "${chrome_offer}" | status_of /offer --data-binary @- "${sdp_header[@]}")"
+expect_equal "setup:passive offer" "400" \
+    "$(sed 's/^a=setup:actpass/a=setup:passive/' "${chrome_offer}" |
+        status_of /offer --data-binary @- "${sdp_header[@]}")"
 expect_equal "GET /offer는 405" "405" "$(status_of /offer)"
 expect_equal "GET /offer의 Allow 헤더" "POST" "$(header_of /offer Allow)"
 expect_equal "길이 없는 POST /offer" "411" "$(printf 'POST /offer HTTP/1.1\r\n\r\n' | raw_status)"

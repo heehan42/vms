@@ -42,7 +42,7 @@
 
 #### Scenario: DTLS 연결 완료
 - **WHEN** ICE 상태가 `connected`가 된 뒤 DTLS 핸드셰이크가 끝난다
-- **THEN** 화면의 연결 상태는 `connected`로 바뀌고, DTLS 상태 `connected`와 SRTP 암호 `AES_CM_128_HMAC_SHA1_80`이 표시된다
+- **THEN** 화면의 연결 상태는 `connected`로 바뀌고, DTLS 상태 `connected`와 SRTP 암호 `SRTP_AES128_CM_HMAC_SHA1_80`이 표시된다
 
 #### Scenario: 시그널링 실패 표시
 - **WHEN** 서버가 offer에 `400 Bad Request`로 응답한다

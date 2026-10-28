@@ -12,7 +12,8 @@
 
     <h2>연결 확인</h2>
     <button id="connect-button" type="button">연결</button>
-    <!-- 아직 DTLS를 구현하지 않았으므로, ICE 상태가 connected가 된 뒤 연결 상태는 failed가 되는 것이 정상이다. -->
+    <!-- ICE 상태가 connected가 된 뒤 DTLS 핸드셰이크가 끝나면 연결 상태가 connected가 된다.
+         DTLS 상태와 SRTP 암호는 연결 상태가 connected가 되었을 때 transport 통계에서 읽는다. -->
     <dl>
         <dt>시그널링</dt>
         <dd id="signaling-status">시작 전</dd>
@@ -20,6 +21,10 @@
         <dd id="ice-state">-</dd>
         <dt>연결 상태 (connectionState)</dt>
         <dd id="connection-state">-</dd>
+        <dt>DTLS 상태 (dtlsState)</dt>
+        <dd id="dtls-state">-</dd>
+        <dt>SRTP 암호 (srtpCipher)</dt>
+        <dd id="srtp-cipher">-</dd>
     </dl>
     <script src="app.js"></script>
 </body>

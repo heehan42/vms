@@ -113,6 +113,12 @@ struct SdpOffer {
     std::string ice_pwd;
 
 
+    // 브라우저 인증서의 SHA-256 fingerprint. 대문자 16진수 32쌍을 ':'로 구분한 형식으로 정규화했다.
+    //
+    // DTLS 핸드셰이크에서 받은 브라우저 인증서와 비교한다.
+    std::string remote_fingerprint;
+
+
     // 협상할 H.264 코덱
     H264Codec h264;
 
@@ -161,6 +167,9 @@ std::expected<SdpSessionDescription, std::string> ParseSdp(std::string_view text
 //   - 고른 섹션의 프로토콜이 UDP/TLS/RTP/SAVPF가 아님
 //   - 고른 섹션에 a=mid가 없음
 //   - ICE ufrag 또는 pwd가 없음(미디어 수준을 우선하고, 없으면 세션 수준을 본다)
+//   - sha-256 해시의 a=fingerprint가 없거나 값 형식이 틀림(미디어 수준을 우선한다)
+//   - a=setup이 actpass나 active가 아님. 서버가 DTLS 서버이므로 브라우저는 DTLS 클라이언트여야 한다.
+//     줄이 없으면 RFC 5763의 기본값 active로 본다.
 //   - packetization-mode=1인 H.264가 없음
 //
 // H.264가 여럿이면 profile-level-id=42e01f(Constrained Baseline)를 우선하고, 없으면 첫 번째를 고른다.
