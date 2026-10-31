@@ -7,6 +7,7 @@ const iceState = document.getElementById("ice-state");
 const connectionState = document.getElementById("connection-state");
 const dtlsState = document.getElementById("dtls-state");
 const srtpCipher = document.getElementById("srtp-cipher");
+const remoteVideo = document.getElementById("remote-video");
 
 // 연결 버튼을 다시 누르면 이전 연결을 닫고 새로 시작하기 위해 보관한다.
 let peerConnection = null;
@@ -40,6 +41,16 @@ async function connect() {
     peerConnection = connection;
     dtlsState.textContent = "-";
     srtpCipher.textContent = "-";
+    // 이전 연결의 마지막 화면이 새 연결의 영상처럼 보이지 않도록 비운다.
+    remoteVideo.srcObject = null;
+
+    // 받은 비디오 트랙을 표시한다. answer의 a=msid가 있으면 그 스트림을, 없으면 트랙만으로 만든 스트림을 쓴다.
+    connection.addEventListener("track", (event) => {
+        if (connection !== peerConnection) {
+            return;
+        }
+        remoteVideo.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+    });
 
     // 상태가 바뀔 때마다 화면을 갱신한다. 이전 연결의 이벤트는 무시한다.
     const showStates = () => {

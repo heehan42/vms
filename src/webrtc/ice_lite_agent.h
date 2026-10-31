@@ -18,8 +18,10 @@
 #include "core/event_loop.h"
 #include "core/unique_fd.h"
 #include "crypto/dtls_context.h"
+#include "media/h264_file.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_candidate.h"
+#include "webrtc/video_stream_sender.h"
 
 
 namespace vms::webrtc {
@@ -39,17 +41,47 @@ struct IceLiteAgentConfig {
     //
     // 명령행 인자로는 노출하지 않으며, 테스트가 짧은 값을 쓰기 위해 둔다.
     std::chrono::milliseconds session_timeout = std::chrono::seconds(30);
+
+
+    // DTLS가 완료된 세션에 보낼 동영상. 비어 있으면 미디어를 보내지 않는다.
+    //
+    // 참조만 하므로 에이전트보다 오래 살아 있어야 한다.
+    const media::H264File* video_file = nullptr;
+
+
+    // 동영상 재생 속도(초당 프레임 수). 1 이상이어야 하며, video_file이 있을 때만 쓴다.
+    int video_fps = 30;
 };
 
 
-// 세션을 만들 때 서버가 새로 정한 ICE 자격 증명. SDP answer에 넣는다.
-struct IceCredentials {
+// offer 하나로 세션을 만들 때 필요한 브라우저 쪽 값.
+struct IceSessionRequest {
+    // offer의 브라우저 ice-ufrag. STUN USERNAME 뒷부분과 비교한다.
+    std::string_view remote_ufrag;
+
+
+    // offer의 브라우저 인증서 SHA-256 fingerprint(대문자 정규화). DTLS 핸드셰이크에서 받은 브라우저
+    // 인증서와 비교한다.
+    std::string_view remote_fingerprint;
+
+
+    // answer에서 정한 H.264 payload type(0~127). 이 세션이 보내는 RTP 헤더에 넣는다.
+    std::uint8_t h264_payload_type = 0;
+};
+
+
+// 세션을 만들 때 서버가 새로 정한 값. SDP answer에 넣는다.
+struct IceSessionParameters {
     // 서버 ICE ufrag(8자). 브라우저가 STUN USERNAME 앞부분에 넣어 세션을 가리킨다.
     std::string ice_ufrag;
 
 
     // 서버 ICE pwd(24자). STUN MESSAGE-INTEGRITY 키다.
     std::string ice_pwd;
+
+
+    // 이 세션의 송신 SSRC. 0이 아니며 다른 세션과 겹치지 않는다. answer의 a=ssrc에 넣는다.
+    std::uint32_t ssrc = 0;
 };
 
 
@@ -70,7 +102,8 @@ enum class IceSessionState {
 // 브라우저의 nomination을 받아들이기만 하며, 먼저 요청을 보내지 않는다.
 // 설정한 주소마다 UDP 소켓 하나를 소유하고, 모든 세션이 이 소켓들을 함께 쓴다. 응답은 요청이 도착한
 // 소켓에서 보내 출발 주소가 요청의 목적지와 같게 한다.
-// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다.
+// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 동영상이 설정되어 있으면 DTLS가 완료된
+// 세션마다 VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다.
 // 루프 핸들러와 타이머가 이 객체의 주소를 캡처하므로 std::unique_ptr로만 다루며 이동하지 않는다.
 // 연결된 EventLoop와 DtlsContext보다 먼저 소멸해야 한다.
 class IceLiteAgent {
@@ -78,7 +111,7 @@ public:
     // 주소마다 UDP 소켓을 열어 루프에 등록하고 패킷을 받기 시작한다.
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프. 반환된 에이전트보다 오래 살아 있어야 한다.
-    // config: 주소 목록, 포트, 세션 만료 시간. 주소가 하나 이상이어야 한다.
+    // config: 주소 목록, 포트, 세션 만료 시간, 동영상. 주소가 하나 이상이어야 한다.
     // dtls_context: 세션마다 DtlsTransport를 만들 컨텍스트. 참조만 하므로 반환된 에이전트보다 오래
     //   살아 있어야 한다.
     // 반환값: 시작된 에이전트. 주소가 없거나, 어느 한 주소라도 소켓 생성·바인드·등록에 실패하면
@@ -87,7 +120,8 @@ public:
         core::EventLoop& loop, IceLiteAgentConfig config, const crypto::DtlsContext& dtls_context);
 
 
-    // 모든 세션의 타이머를 취소하고, 모든 소켓의 루프 등록을 해제하고 닫는다.
+    // 모든 세션의 타이머를 취소하고(송신 중인 세션은 송신 중지 로그를 남긴다), 모든 소켓의 루프 등록을
+    // 해제하고 닫는다.
     ~IceLiteAgent();
 
 
@@ -101,15 +135,13 @@ public:
 
     // offer 하나에 대한 ICE 세션을 만든다.
     //
-    // remote_ufrag: offer의 브라우저 ice-ufrag. STUN USERNAME 뒷부분과 비교한다.
-    // remote_fingerprint: offer의 브라우저 인증서 SHA-256 fingerprint(대문자 정규화). DTLS 핸드셰이크에서
-    //   받은 브라우저 인증서와 비교한다.
-    // 반환값: 서버 자격 증명. 난수 생성에 실패하면 오류 메시지
+    // request: 브라우저 ufrag, fingerprint, H.264 payload type. 호출 동안만 참조한다.
+    // 반환값: 서버 자격 증명과 송신 SSRC. 난수 생성에 실패하면 오류 메시지
     //
-    // 세션은 서버 ufrag로 구분하며, 세션 테이블에 있는 ufrag와 겹치지 않게 만든다. 만든 세션은
+    // 세션은 서버 ufrag로 구분하며, 세션 테이블에 있는 ufrag·SSRC와 겹치지 않게 만든다. SSRC와 payload
+    // type은 동영상이 없어도 정해 answer 형식이 설정과 무관하게 같게 한다. 만든 세션은
     // config.session_timeout 동안 유효한 Binding 요청이 없으면 제거된다.
-    std::expected<IceCredentials, std::string> CreateSession(std::string_view remote_ufrag,
-                                                             std::string_view remote_fingerprint);
+    std::expected<IceSessionParameters, std::string> CreateSession(const IceSessionRequest& request);
 
 
     // answer에 넣을 host candidate 목록을 돌려준다.
@@ -218,6 +250,28 @@ private:
 
         // 걸려 있는 세션 만료 타이머. 세션이 있는 동안 항상 하나가 걸려 있다.
         core::EventLoop::TimerId expiry_timer_id = 0;
+
+
+        // 이 세션이 보내는 RTP의 SSRC. answer의 a=ssrc 값이다.
+        std::uint32_t ssrc = 0;
+
+
+        // 이 세션이 보내는 RTP의 H.264 payload type. answer에서 정한 값이다.
+        std::uint8_t h264_payload_type = 0;
+
+
+        // 동영상 송신 상태. DTLS가 완료되고 동영상이 설정되어 있을 때 만들며, 송신을 멈추면 지운다.
+        //
+        // 값이 있는 동안 frame_timer_id의 타이머가 걸려 있거나 그 핸들러가 실행 중이다.
+        std::unique_ptr<VideoStreamSender> video_stream_sender;
+
+
+        // 걸려 있는 프레임 타이머. 없으면 0
+        core::EventLoop::TimerId frame_timer_id = 0;
+
+
+        // 동영상 패킷의 송신 실패를 이미 로그에 남겼는지 여부. 세션마다 첫 실패만 남긴다.
+        bool has_logged_send_failure = false;
     };
 
 
@@ -229,10 +283,10 @@ private:
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프
     // sockets: 소유권을 넘겨받을 소켓 목록
-    // session_timeout: 세션 만료 시간
+    // config: 세션 만료 시간과 동영상 설정. 주소와 포트는 쓰지 않는다.
     // dtls_context: DtlsTransport를 만들 컨텍스트
-    IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets,
-                 std::chrono::milliseconds session_timeout, const crypto::DtlsContext& dtls_context);
+    IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets, const IceLiteAgentConfig& config,
+                 const crypto::DtlsContext& dtls_context);
 
 
     // 소켓에 대기 중인 패킷을 정해진 수까지 읽어 처리한다. 소켓이 읽기 가능할 때 호출된다.
@@ -298,8 +352,37 @@ private:
     // session: DtlsTransport를 가진 세션
     // datagrams: DtlsTransport가 돌려준 데이터그램
     // previous_state: 호출 전 DTLS 상태
+    //
+    // kConnected가 되면 동영상 송신을 시작하고, kClosed나 kFailed가 되면 송신을 멈춘다.
     void FinishDtlsStep(SessionIterator session, const std::vector<Datagram>& datagrams,
                         DtlsState previous_state);
+
+
+    // DTLS가 완료된 세션의 동영상 송신을 시작한다. 동영상이 설정되지 않았으면 아무것도 하지 않는다.
+    //
+    // session: kConnected가 된 DtlsTransport를 가진 세션
+    //
+    // 서버용 SRTP 키로 VideoStreamSender를 만들고 0ms 프레임 타이머를 건다. 생성에 실패하면 로그만
+    // 남기며 DTLS는 연결된 채로 둔다.
+    void StartVideoStream(SessionIterator session);
+
+
+    // 프레임 타이머가 실행되었을 때 예정된 프레임을 nominated pair로 보내고 다음 프레임 타이머를 건다.
+    //
+    // local_ufrag: 타이머를 건 세션의 서버 ufrag. 그 사이 세션이 제거되었거나 송신을 멈췄으면 아무것도
+    //   하지 않는다.
+    //
+    // 송신에 실패한 패킷은 다시 보내지 않고 버린다. SRTP 보호가 실패하면 그 세션의 송신을 멈춘다.
+    void HandleFrameTimer(const std::string& local_ufrag);
+
+
+    // 세션의 동영상 송신을 멈추고 로그를 남긴다. 송신 중이 아니면 아무것도 하지 않는다.
+    //
+    // session: 송신을 멈출 세션
+    // reason: 로그에 남길 중지 원인
+    //
+    // 프레임 타이머를 취소하고 VideoStreamSender를 지운다. 세션 자체는 그대로 둔다.
+    void StopVideoStream(SessionIterator session, std::string_view reason);
 
 
     // 세션 만료 타이머가 실행되었을 때, 마지막 요청 뒤 만료 시간이 지났으면 세션을 제거하고 아니면
@@ -325,8 +408,8 @@ private:
     //
     // session: 제거할 세션. 호출 뒤에는 무효다.
     //
-    // 타이머 취소, nominated pair 테이블 항목 삭제, 세션 삭제 순서로 한다. 세션을 지우면 DtlsTransport의
-    // SSL이 함께 해제된다.
+    // 송신 중지, 타이머 취소, nominated pair 테이블 항목 삭제, 세션 삭제 순서로 한다. 세션을 지우면
+    // DtlsTransport의 SSL이 함께 해제된다.
     void RemoveSession(SessionIterator session);
 
 
@@ -349,6 +432,14 @@ private:
 
     // 세션 만료 시간
     std::chrono::milliseconds session_timeout_;
+
+
+    // DTLS가 완료된 세션에 보낼 동영상. 없으면 nullptr이며, 에이전트보다 오래 산다.
+    const media::H264File* video_file_;
+
+
+    // 동영상 재생 속도(초당 프레임 수)
+    int video_fps_;
 
 
     // 주소별 UDP 소켓. 설정 주소 순서이며 candidates_와 같은 위치끼리 대응한다.

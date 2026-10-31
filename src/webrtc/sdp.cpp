@@ -421,6 +421,8 @@ std::string BuildSdpAnswer(const SdpOffer& offer, const SdpAnswerParameters& par
         append("a=rtcp-mux\r\n");
         append("a=rtpmap:{} H264/90000\r\n", payload_type);
         append("a=fmtp:{} {}\r\n", payload_type, offer.h264.format_parameters);
+        append("a=msid:{} {}\r\n", parameters.media_stream_id, parameters.track_id);
+        append("a=ssrc:{} cname:{}\r\n", parameters.ssrc, parameters.cname);
         append("a=ice-ufrag:{}\r\n", parameters.ice_ufrag);
         append("a=ice-pwd:{}\r\n", parameters.ice_pwd);
         append("a=fingerprint:sha-256 {}\r\n", parameters.sha256_fingerprint);

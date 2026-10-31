@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
+#include <format>
 #include <print>
 #include <string>
 
@@ -45,6 +47,32 @@ std::expected<std::uint64_t, std::string> GenerateSessionId() {
 }
 
 
+// answer의 cname 길이. RFC 7022가 권고하는 96비트 이상의 무작위 값이 되도록 64가지 문자 16개를 쓴다.
+constexpr std::size_t kCnameLength = 16;
+
+
+// answer의 a=msid 스트림 ID. 세션마다 RTCPeerConnection이 따로 있으므로 모든 세션이 같은 값을 쓴다.
+constexpr std::string_view kMediaStreamId = "vms";
+
+
+// answer의 a=msid 트랙 ID
+constexpr std::string_view kVideoTrackId = "video";
+
+
+// offer의 payload type 문자열을 RTP 헤더에 넣을 정수로 바꾼다.
+//
+// payload_type: SelectH264Codec이 offer의 포맷 목록에서 고른 값
+// 반환값: 0~127 정수. 숫자가 아니거나 범위를 벗어나면 원인 문구
+std::expected<std::uint8_t, std::string> ParsePayloadType(std::string_view payload_type) {
+    int value = -1;
+    const auto [end, error] = std::from_chars(payload_type.data(), payload_type.data() + payload_type.size(), value);
+    if (error != std::errc() || end != payload_type.data() + payload_type.size() || value < 0 || value > 127) {
+        return std::unexpected(std::format("H.264 payload type이 0~127 정수가 아님: {}", payload_type));
+    }
+    return static_cast<std::uint8_t>(value);
+}
+
+
 }  // namespace
 
 
@@ -68,24 +96,38 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
         return http::HttpEndpointResponse::Error(http::HttpStatus::kBadRequest);
     }
 
+    const auto payload_type = ParsePayloadType(offer->h264.payload_type);
+    if (!payload_type) {
+        std::println(stderr, "offer 거부: {}", payload_type.error());
+        return http::HttpEndpointResponse::Error(http::HttpStatus::kBadRequest);
+    }
+
+    // 세션을 만든 뒤 난수 생성이 실패하면 쓰지 않을 세션이 만료될 때까지 남으므로, 난수 값을 먼저 만든다.
     const auto session_id = GenerateSessionId();
-    auto credentials = session_id ? agent_.CreateSession(offer->ice_ufrag, offer->remote_fingerprint)
-                                  : std::expected<IceCredentials, std::string>(
-                                        std::unexpected(session_id.error()));
-    if (!credentials) {
-        std::println(stderr, "ICE 세션 생성 실패: {}", credentials.error());
+    auto cname = session_id ? crypto::GenerateIceCharString(kCnameLength)
+                            : std::expected<std::string, std::string>(std::unexpected(session_id.error()));
+    auto session = cname ? agent_.CreateSession(IceSessionRequest{.remote_ufrag = offer->ice_ufrag,
+                                                                  .remote_fingerprint = offer->remote_fingerprint,
+                                                                  .h264_payload_type = *payload_type})
+                         : std::expected<IceSessionParameters, std::string>(std::unexpected(cname.error()));
+    if (!session) {
+        std::println(stderr, "ICE 세션 생성 실패: {}", session.error());
         return http::HttpEndpointResponse::Error(http::HttpStatus::kInternalServerError);
     }
 
     SdpAnswerParameters parameters;
     parameters.session_id = *session_id;
-    parameters.ice_ufrag = credentials->ice_ufrag;
-    parameters.ice_pwd = credentials->ice_pwd;
+    parameters.ice_ufrag = session->ice_ufrag;
+    parameters.ice_pwd = session->ice_pwd;
     parameters.sha256_fingerprint = certificate_.Sha256Fingerprint();
     parameters.candidates = agent_.Candidates();
+    parameters.ssrc = session->ssrc;
+    parameters.cname = *std::move(cname);
+    parameters.media_stream_id = kMediaStreamId;
+    parameters.track_id = kVideoTrackId;
 
-    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}",
-                 credentials->ice_ufrag, offer->ice_ufrag, offer->h264.payload_type);
+    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}",
+                 session->ice_ufrag, offer->ice_ufrag, *payload_type, session->ssrc);
     return http::HttpEndpointResponse{.status = http::HttpStatus::kOk,
                                       .content_type = "application/sdp",
                                       .body = BuildSdpAnswer(*offer, parameters)};

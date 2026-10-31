@@ -23,16 +23,21 @@ add_library(server_core STATIC
     src/crypto/hmac_sha1.cpp
     src/crypto/openssl_error.cpp
     src/crypto/random.cpp
+    src/crypto/srtp.cpp
     src/http/http_request.cpp
     src/http/http_response.cpp
     src/http/http_server.cpp
     src/http/mime_type.cpp
     src/http/static_files.cpp
+    src/media/h264_file.cpp
     src/webrtc/dtls_transport.cpp
+    src/webrtc/h264_packetizer.cpp
     src/webrtc/ice_lite_agent.cpp
+    src/webrtc/rtp_packet.cpp
     src/webrtc/sdp.cpp
     src/webrtc/signaling.cpp
     src/webrtc/stun_message.cpp
+    src/webrtc/video_stream_sender.cpp
 )
 target_include_directories(server_core PUBLIC src)
 target_link_libraries(server_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)

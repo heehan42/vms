@@ -141,6 +141,15 @@ else
 fi
 expect_equal "answer마다 같은 fingerprint" "$(grep '^a=fingerprint:' <<< "${first_answer}")" \
     "$(grep '^a=fingerprint:' <<< "${second_answer}")"
+expect_equal "answer의 a=msid" "1" "$(grep -c '^a=msid:[^ ]* [^ ]*$' <<< "${first_answer}")"
+expect_equal "answer의 a=ssrc" "1" "$(grep -c '^a=ssrc:[1-9][0-9]* cname:..*$' <<< "${first_answer}")"
+first_ssrc="$(grep '^a=ssrc:' <<< "${first_answer}" | cut -d ' ' -f 1)"
+second_ssrc="$(grep '^a=ssrc:' <<< "${second_answer}" | cut -d ' ' -f 1)"
+if [[ -n "${first_ssrc}" && "${first_ssrc}" != "${second_ssrc}" ]]; then
+    expect_equal "answer마다 다른 SSRC" "다름" "다름"
+else
+    expect_equal "answer마다 다른 SSRC" "다름" "같음 또는 없음"
+fi
 
 # 시그널링 요청 오류
 expect_equal "offer Content-Type 오류" "415" \
@@ -173,6 +182,28 @@ kill -TERM "${server_pid}"
 wait "${server_pid}"
 expect_equal "SIGTERM 후 종료 코드" "0" "$?"
 server_pid=""
+
+# 동영상 인자 오류는 서버를 띄우기 전에 0이 아닌 코드로 끝나야 한다.
+# 잘못 시작해 대기하는 경우에도 테스트가 멈추지 않도록 timeout으로 감싼다.
+# $1: 검사 설명, 나머지: 서버에 넘길 추가 인자
+expect_startup_failure() {
+    local description="$1"
+    shift
+    timeout 5 "${server_binary}" --port "${port}" --web-root "${web_root}" \
+        --ice-address 127.0.0.1 --ice-port "${ice_port}" "$@" 2>> "${server_log}"
+    local exit_code=$?
+    if (( exit_code != 0 && exit_code != 124 )); then
+        expect_equal "${description}" "0이 아님" "0이 아님"
+    else
+        expect_equal "${description}" "0이 아님" "${exit_code}"
+    fi
+}
+
+printf 'this is not an h264 stream\n' > "${work_dir}/not_h264.txt"
+expect_startup_failure "--video-fps 0" --video-fps 0
+expect_startup_failure "--video-fps abc" --video-fps abc
+expect_startup_failure "없는 --video-file" --video-file "${work_dir}/missing.h264"
+expect_startup_failure "시작 코드 없는 --video-file" --video-file "${work_dir}/not_h264.txt"
 
 if (( failure_count > 0 )); then
     echo "--- 서버 로그 ---"

@@ -5,6 +5,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <print>
 #include <span>
 #include <string>
@@ -17,6 +18,7 @@
 #include "crypto/certificate.h"
 #include "crypto/dtls_context.h"
 #include "http/http_server.h"
+#include "media/h264_file.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_lite_agent.h"
 #include "webrtc/signaling.h"
@@ -30,6 +32,7 @@ using vms::crypto::DtlsContext;
 using vms::http::HttpRequest;
 using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
+using vms::media::H264File;
 using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
@@ -42,7 +45,16 @@ namespace {
 // 명령행 사용법
 constexpr std::string_view kUsage =
     "사용법: vms_web_server [--port <1-65535>] [--web-root <디렉터리>]\n"
-    "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...";
+    "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...\n"
+    "                      [--video-file <H.264 Annex-B 파일>] [--video-fps <1-120>]";
+
+
+// --video-fps를 생략했을 때의 재생 속도
+constexpr int kDefaultVideoFps = 30;
+
+
+// --video-fps로 받을 수 있는 최대 재생 속도
+constexpr int kMaxVideoFps = 120;
 
 
 // 명령행으로 받는 서버 전체의 실행 설정.
@@ -57,6 +69,14 @@ struct ServerOptions {
 
     // --ice-address로 지정한 주소. 비어 있으면 인터페이스 주소를 자동으로 조회한다.
     std::vector<in_addr> ice_addresses;
+
+
+    // --video-file로 지정한 동영상 파일. 비어 있으면 미디어를 보내지 않는다.
+    std::optional<fs::path> video_file;
+
+
+    // 동영상 재생 속도(초당 프레임 수)
+    int video_fps = kDefaultVideoFps;
 };
 
 
@@ -74,12 +94,27 @@ std::expected<std::uint16_t, std::string> ParsePort(std::string_view text) {
 }
 
 
+// 재생 속도 문자열을 숫자로 바꾼다.
+//
+// text: 10진수 초당 프레임 수 문자열
+// 반환값: 1~120 범위의 값. 숫자가 아니거나 범위를 벗어나면 오류 메시지
+std::expected<int, std::string> ParseVideoFps(std::string_view text) {
+    int fps = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), fps);
+    if (error != std::errc() || end != text.data() + text.size() || fps < 1 || fps > kMaxVideoFps) {
+        return std::unexpected(std::format("잘못된 재생 속도: {} (1~{} 정수)", text, kMaxVideoFps));
+    }
+    return fps;
+}
+
+
 // 명령행 인자를 서버 설정으로 바꾼다.
 //
 // arguments: 프로그램 이름을 제외한 인자 목록
 // 반환값: 해석 결과
-//   - 서버 설정: 생략한 항목은 기본값(포트 8080, 웹 루트 ./web, ICE 포트 50000, ICE 주소 자동)이다.
-//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트나 IPv4 주소
+//   - 서버 설정: 생략한 항목은 기본값(포트 8080, 웹 루트 ./web, ICE 포트 50000, ICE 주소 자동,
+//     동영상 없음, 30fps)이다.
+//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도
 //
 // --ice-address는 여러 번 쓸 수 있으며, 쓴 순서가 candidate 우선순위 순서가 된다.
 std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const> arguments) {
@@ -89,7 +124,7 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const std::string_view option = arguments[index];
         if (option != "--port" && option != "--web-root" && option != "--ice-port" &&
-            option != "--ice-address") {
+            option != "--ice-address" && option != "--video-file" && option != "--video-fps") {
             return std::unexpected(std::format("알 수 없는 인자: {}", option));
         }
         if (index + 1 >= arguments.size()) {
@@ -105,6 +140,14 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             (option == "--port" ? options.http.port : options.ice_port) = *port;
         } else if (option == "--web-root") {
             options.http.web_root = value;
+        } else if (option == "--video-file") {
+            options.video_file = fs::path(value);
+        } else if (option == "--video-fps") {
+            const auto fps = ParseVideoFps(value);
+            if (!fps) {
+                return std::unexpected(fps.error());
+            }
+            options.video_fps = *fps;
         } else {
             const auto address = vms::core::ParseIpv4Address(value);
             if (!address) {
@@ -183,6 +226,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // 파일 오류는 서버를 띄우기 전에 알리고, 에이전트가 참조하므로 에이전트보다 먼저 만들어 나중에 소멸하게 한다.
+    std::optional<H264File> video_file;
+    if (options->video_file) {
+        auto loaded = H264File::Load(*options->video_file);
+        if (!loaded) {
+            std::println(stderr, "{}", loaded.error());
+            return 1;
+        }
+        video_file = *std::move(loaded);
+        std::println(stderr, "동영상 파일 로드: {}, 프레임 {}, {}fps", options->video_file->string(),
+                     video_file->Frames().size(), options->video_fps);
+    }
+
     auto loop = EventLoop::Create();
     if (!loop) {
         std::println(stderr, "이벤트 루프 생성 실패: {}", loop.error().message());
@@ -215,9 +271,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto ice_agent = IceLiteAgent::Start(
-        *loop, IceLiteAgentConfig{.addresses = *std::move(ice_addresses), .port = options->ice_port},
-        *dtls_context);
+    auto ice_agent = IceLiteAgent::Start(*loop,
+                                         IceLiteAgentConfig{.addresses = *std::move(ice_addresses),
+                                                            .port = options->ice_port,
+                                                            .video_file = video_file ? &*video_file : nullptr,
+                                                            .video_fps = options->video_fps},
+                                         *dtls_context);
     if (!ice_agent) {
         std::println(stderr, "ICE 시작 실패: {}", ice_agent.error());
         return 1;

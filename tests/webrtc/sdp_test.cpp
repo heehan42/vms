@@ -55,6 +55,10 @@ SdpAnswerParameters MakeAnswerParameters() {
         IceCandidate{.foundation = 1, .priority = 2130706431, .address = "172.27.209.81", .port = 50000},
         IceCandidate{.foundation = 2, .priority = 2130706175, .address = "127.0.0.1", .port = 50000},
     };
+    parameters.ssrc = 3735928559;
+    parameters.cname = "abcdEFGH1234+/xy";
+    parameters.media_stream_id = "vms";
+    parameters.track_id = "video";
     return parameters;
 }
 
@@ -200,6 +204,34 @@ void TestRejectsExtraSectionsInAnswer() {
 }
 
 
+// 협상 대상 섹션의 a=fmtp 뒤에 a=msid와 a=ssrc가 한 줄씩 있고, 거절한 섹션에는 없는지 검사한다.
+void TestAnnouncesSendingSsrc() {
+    const auto offer = ParseOffer(
+        "v=0\r\na=group:BUNDLE 0 1\r\na=ice-ufrag:u\r\na=ice-pwd:p\r\n"
+        "a=fingerprint:sha-256 0E:6A:A6:4D:F1:A2:6F:95:9F:50:48:0E:6D:31:F5:BD:E5:79:D4:25:87:8B:53:45:5E:E1:DA:A8:FB:4E:50:71\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n"
+        "a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n"
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\na=rtpmap:111 opus/48000/2\r\n");
+    if (!offer) {
+        Expect(false, "SSRC 알림용 offer 해석: " + offer.error());
+        return;
+    }
+    const std::string answer = BuildSdpAnswer(*offer, MakeAnswerParameters());
+    const std::string expected_lines =
+        "a=fmtp:96 packetization-mode=1\r\n"
+        "a=msid:vms video\r\n"
+        "a=ssrc:3735928559 cname:abcdEFGH1234+/xy\r\n";
+    const std::size_t lines = answer.find(expected_lines);
+    const std::size_t audio = answer.find("m=audio 0 ");
+    Expect(lines != std::string::npos, "a=fmtp 뒤에 a=msid와 a=ssrc가 이어져야 한다");
+    Expect(lines != std::string::npos && audio != std::string::npos && lines < audio,
+           "두 줄은 협상 대상 섹션에 있어야 한다");
+    Expect(answer.find("a=msid:") == answer.rfind("a=msid:") &&
+               answer.find("a=ssrc:") == answer.rfind("a=ssrc:"),
+           "거절한 섹션에는 a=msid와 a=ssrc가 없어야 한다");
+}
+
+
 // offer에 BUNDLE 그룹이 없으면 answer에도 넣지 않고, 비디오 섹션에 mid가 없으면 거부하는지 검사한다.
 void TestFollowsOfferBundleAndRequiresMid() {
     const std::string without_bundle =
@@ -313,6 +345,7 @@ int main() {
     TestSelectsVideoInBundle();
     TestBuildsAnswerWithRequiredLines();
     TestRejectsExtraSectionsInAnswer();
+    TestAnnouncesSendingSsrc();
     TestFollowsOfferBundleAndRequiresMid();
     TestInterpretsFingerprint();
     TestRejectsInvalidFingerprintAndSetup();

@@ -148,6 +148,22 @@ struct SdpAnswerParameters {
 
     // 알릴 host candidate. 우선순위가 높은 것부터 나열한다.
     std::vector<IceCandidate> candidates;
+
+
+    // 이 세션의 송신 SSRC. 0이 아닌 값이며 서버가 보내는 RTP 헤더의 SSRC와 같다.
+    std::uint32_t ssrc = 0;
+
+
+    // a=ssrc의 cname. 세션마다 무작위로 만든다(RFC 7022).
+    std::string cname;
+
+
+    // a=msid의 미디어 스트림 ID. 브라우저의 track 이벤트에서 streams[0].id가 된다.
+    std::string media_stream_id;
+
+
+    // a=msid의 트랙 ID
+    std::string track_id;
 };
 
 
@@ -183,8 +199,8 @@ std::expected<SdpOffer, std::string> InterpretOffer(const SdpSessionDescription&
 // 반환값: 줄 끝이 "\r\n"인 answer 원문
 //
 // 미디어 섹션 순서는 offer와 같다. 고른 섹션은 sendonly, rtcp-mux, setup:passive, ice-lite로
-// 받아들이고, 나머지 섹션은 포트 0으로 거절한다. offer에 BUNDLE 그룹이 있었을 때만 고른 섹션 하나로
-// 이루어진 BUNDLE 그룹을 넣는다.
+// 받아들이고 송신 SSRC를 알리는 a=msid와 a=ssrc를 넣으며, 나머지 섹션은 포트 0으로 거절한다.
+// offer에 BUNDLE 그룹이 있었을 때만 고른 섹션 하나로 이루어진 BUNDLE 그룹을 넣는다.
 std::string BuildSdpAnswer(const SdpOffer& offer, const SdpAnswerParameters& parameters);
 
 
