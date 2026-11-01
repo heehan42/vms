@@ -34,6 +34,7 @@ using vms::crypto::DtlsContext;
 using vms::media::H264File;
 using vms::test::DtlsTestClient;
 using vms::test::Expect;
+using vms::test::AppendSyntheticNalUnit;
 using vms::test::MakeSyntheticH264File;
 using vms::test::ParseRtpPacket;
 using vms::test::ReassembleNalUnits;
@@ -162,11 +163,29 @@ constexpr std::chrono::milliseconds kVideoSessionTimeout = 500ms;
 //
 // agent: 세션을 만들 에이전트
 // remote_fingerprint: 브라우저 인증서 fingerprint
+// video: 세션에 지정할 동영상. nullptr이면 동영상 없는 세션
 // 반환값: CreateSession의 결과
 std::expected<IceSessionParameters, std::string> CreateTestSession(IceLiteAgent& agent,
-                                                                   std::string_view remote_fingerprint) {
-    return agent.CreateSession(IceSessionRequest{
-        .remote_ufrag = "brow", .remote_fingerprint = remote_fingerprint, .h264_payload_type = kTestPayloadType});
+                                                                   std::string_view remote_fingerprint,
+                                                                   const H264File* video = nullptr) {
+    return agent.CreateSession(IceSessionRequest{.remote_ufrag = "brow",
+                                                 .remote_fingerprint = remote_fingerprint,
+                                                 .h264_payload_type = kTestPayloadType,
+                                                 .video = video,
+                                                 .video_id = "test.h264"});
+}
+
+
+// MakeSyntheticH264File과 내용이 다른 프레임 2개짜리 합성 동영상을 만든다.
+//
+// 반환값: SPS·PPS·500바이트 IDR 프레임, 200바이트 슬라이스 프레임
+H264File MakeOtherSyntheticH264File() {
+    std::vector<std::uint8_t> bytes;
+    AppendSyntheticNalUnit(bytes, 0x67, 0x42, 8);
+    AppendSyntheticNalUnit(bytes, 0x68, 0xCE, 4);
+    AppendSyntheticNalUnit(bytes, 0x65, 0x88, 500);
+    AppendSyntheticNalUnit(bytes, 0x41, 0x9A, 200);
+    return *H264File::FromBytes(std::move(bytes));
 }
 
 
@@ -578,13 +597,14 @@ struct MediaReceiver {
 //
 // loop: 에이전트가 등록된 이벤트 루프
 // agent: 세션을 만들 에이전트
+// video: 세션에 지정할 동영상. nullptr이면 동영상 없는 세션
 // 반환값: 핸드셰이크를 마친 수신 측. 준비에 실패하면 빈 optional
-std::optional<MediaReceiver> ConnectMediaReceiver(EventLoop& loop, IceLiteAgent& agent) {
+std::optional<MediaReceiver> ConnectMediaReceiver(EventLoop& loop, IceLiteAgent& agent, const H264File* video) {
     auto dtls_client = DtlsTestClient::Create(true);
     if (!dtls_client) {
         return std::nullopt;
     }
-    auto session = CreateTestSession(agent, dtls_client->Sha256Fingerprint());
+    auto session = CreateTestSession(agent, dtls_client->Sha256Fingerprint(), video);
     TestClient client = OpenClient();
     if (!session || !client.socket.IsValid()) {
         return std::nullopt;
@@ -642,7 +662,7 @@ std::optional<std::vector<std::vector<ReceivedRtpPacket>>> DecryptFrames(const M
 // 핸드셰이크 뒤 받은 패킷이 세션의 SSRC·payload type을 쓰고, 순번이 연속되며, 첫 5프레임이 소스 0,1,2,0,1과
 // 같은지 검사한다.
 void TestStreamsVideoAfterHandshake(EventLoop& loop, IceLiteAgent& agent, const H264File& video) {
-    auto receiver = ConnectMediaReceiver(loop, agent);
+    auto receiver = ConnectMediaReceiver(loop, agent, &video);
     if (!receiver) {
         Expect(false, "동영상 수신 측 연결");
         return;
@@ -679,9 +699,9 @@ void TestStreamsVideoAfterHandshake(EventLoop& loop, IceLiteAgent& agent, const 
 
 
 // 두 세션이 동시에 받고, 한 세션의 close_notify 뒤에는 그 세션만 패킷이 끊기는지 검사한다.
-void TestStopsOnlyClosedSession(EventLoop& loop, IceLiteAgent& agent) {
-    auto closing = ConnectMediaReceiver(loop, agent);
-    auto continuing = ConnectMediaReceiver(loop, agent);
+void TestStopsOnlyClosedSession(EventLoop& loop, IceLiteAgent& agent, const H264File& video) {
+    auto closing = ConnectMediaReceiver(loop, agent, &video);
+    auto continuing = ConnectMediaReceiver(loop, agent, &video);
     if (!closing || !continuing) {
         Expect(false, "두 수신 측 연결");
         return;
@@ -707,24 +727,61 @@ void TestStopsOnlyClosedSession(EventLoop& loop, IceLiteAgent& agent) {
 }
 
 
-// 동영상이 없는 에이전트는 핸드셰이크 뒤에도 RTP를 보내지 않는지 검사한다.
+// 동영상이 지정되지 않은 세션은 핸드셰이크 뒤에도 RTP를 받지 않는지 검사한다.
 void TestNoMediaWithoutVideo(EventLoop& loop, IceLiteAgent& agent) {
-    auto receiver = ConnectMediaReceiver(loop, agent);
+    auto receiver = ConnectMediaReceiver(loop, agent, nullptr);
     if (!receiver) {
-        Expect(false, "동영상 없는 에이전트에 수신 측 연결");
+        Expect(false, "동영상 없는 세션의 수신 측 연결");
         return;
     }
     RunLoopFor(loop, 100ms);
     Expect(receiver->srtp_packets.empty() && FilterRtpPackets(DrainSocket(receiver->client)).empty(),
-           "동영상이 없으면 RTP를 보내지 않아야 한다");
+           "동영상이 없는 세션에는 RTP를 보내지 않아야 한다");
+}
+
+
+// 같은 에이전트의 세션마다 지정한 동영상을 보내고, 동영상이 없는 세션에는 보내지 않는지 검사한다.
+void TestStreamsVideoPerSession(EventLoop& loop, IceLiteAgent& agent, const H264File& first_video,
+                                const H264File& second_video) {
+    auto first = ConnectMediaReceiver(loop, agent, &first_video);
+    auto second = ConnectMediaReceiver(loop, agent, &second_video);
+    auto without_video = ConnectMediaReceiver(loop, agent, nullptr);
+    if (!first || !second || !without_video) {
+        Expect(false, "세션별 동영상 수신 측 연결");
+        return;
+    }
+    RunLoopFor(loop, 100ms);
+    std::ranges::move(FilterRtpPackets(DrainSocket(first->client)), std::back_inserter(first->srtp_packets));
+    std::ranges::move(FilterRtpPackets(DrainSocket(second->client)), std::back_inserter(second->srtp_packets));
+
+    // 각 세션의 첫 프레임이 자기 동영상의 첫 프레임인지 본다. 두 동영상의 IDR 크기가 달라 구분된다.
+    const auto first_frames = DecryptFrames(*first);
+    const auto second_frames = DecryptFrames(*second);
+    if (!first_frames || first_frames->empty() || !second_frames || second_frames->empty()) {
+        Expect(false, "두 세션 모두 프레임을 받아야 한다");
+        return;
+    }
+    const auto reassemble = [](const std::vector<ReceivedRtpPacket>& frame) {
+        std::vector<std::vector<std::uint8_t>> payloads;
+        for (const ReceivedRtpPacket& packet : frame) {
+            payloads.push_back(packet.payload);
+        }
+        return ReassembleNalUnits(payloads);
+    };
+    Expect(reassemble(first_frames->front()) == TransmittedNalUnits(first_video.Frames().front()),
+           "첫 세션은 자기 동영상의 첫 프레임부터 받는다");
+    Expect(reassemble(second_frames->front()) == TransmittedNalUnits(second_video.Frames().front()),
+           "둘째 세션은 다른 동영상의 첫 프레임부터 받는다");
+    Expect(without_video->srtp_packets.empty() && FilterRtpPackets(DrainSocket(without_video->client)).empty(),
+           "같은 에이전트라도 동영상 없는 세션에는 보내지 않는다");
 }
 
 
 // 송신 중인 세션이 만료되면 패킷이 더 오지 않는지 검사한다.
 //
 // agent: 만료 시간이 kVideoSessionTimeout인 동영상 에이전트
-void TestStopsWhenSessionExpires(EventLoop& loop, IceLiteAgent& agent) {
-    auto receiver = ConnectMediaReceiver(loop, agent);
+void TestStopsWhenSessionExpires(EventLoop& loop, IceLiteAgent& agent, const H264File& video) {
+    auto receiver = ConnectMediaReceiver(loop, agent, &video);
     if (!receiver) {
         Expect(false, "만료 시나리오 수신 측 연결");
         return;
@@ -780,18 +837,18 @@ int main() {
     TestKeepsFirstNominatedPairForDtls(*loop, **agent);
     TestNoMediaWithoutVideo(*loop, **agent);
 
-    // 동영상 송신 시나리오는 프레임 3개짜리 합성 동영상을 높은 fps로 보내는 에이전트로 검사한다.
+    // 동영상 송신 시나리오는 합성 동영상을 세션에 지정하고 높은 fps로 보내는 에이전트로 검사한다.
     const H264File video = MakeSyntheticH264File();
+    const H264File other_video = MakeOtherSyntheticH264File();
     auto video_agent = IceLiteAgent::Start(
-        *loop,
-        IceLiteAgentConfig{.addresses = {loopback}, .port = 0, .video_file = &video, .video_fps = kTestVideoFps},
-        *dtls_context);
+        *loop, IceLiteAgentConfig{.addresses = {loopback}, .port = 0, .video_fps = kTestVideoFps}, *dtls_context);
     if (!video_agent) {
         Expect(false, "동영상 에이전트 시작: " + video_agent.error());
         return vms::test::ExitCode();
     }
     TestStreamsVideoAfterHandshake(*loop, **video_agent, video);
-    TestStopsOnlyClosedSession(*loop, **video_agent);
+    TestStopsOnlyClosedSession(*loop, **video_agent, video);
+    TestStreamsVideoPerSession(*loop, **video_agent, video, other_video);
 
     // 세션 만료 시나리오는 만료 시간을 짧게 둔 별도 에이전트로 검사한다.
     auto short_timeout_agent = IceLiteAgent::Start(
@@ -811,14 +868,13 @@ int main() {
                                                          IceLiteAgentConfig{.addresses = {loopback},
                                                                             .port = 0,
                                                                             .session_timeout = kVideoSessionTimeout,
-                                                                            .video_file = &video,
                                                                             .video_fps = kTestVideoFps},
                                                          *dtls_context);
     if (!short_timeout_video_agent) {
         Expect(false, "만료 시간이 짧은 동영상 에이전트 시작: " + short_timeout_video_agent.error());
         return vms::test::ExitCode();
     }
-    TestStopsWhenSessionExpires(*loop, **short_timeout_video_agent);
+    TestStopsWhenSessionExpires(*loop, **short_timeout_video_agent, video);
 
     // 에이전트는 루프, DTLS 컨텍스트, 동영상보다 먼저 소멸해야 한다.
     short_timeout_video_agent->reset();

@@ -168,6 +168,18 @@ expect_equal "chunked POST /offer" "501" \
 expect_equal "큰 본문 POST /offer" "413" \
     "$(printf 'POST /offer HTTP/1.1\r\nContent-Length: 100000\r\n\r\n' | raw_status)"
 
+# 동영상 목록과 선택. 이 서버는 --video-dir 없이 실행했으므로 목록이 비어 있다.
+expect_equal "동영상 없는 서버의 목록" '{"videos":[]}' "$(curl -s "${base_url}/api/videos")"
+expect_equal "목록 Content-Type" "application/json" "$(header_of /api/videos Content-Type)"
+expect_equal "POST /api/videos는 405" "405" "$(status_of /api/videos -X POST -H 'Content-Length: 0')"
+expect_equal "POST /api/videos의 Allow 헤더" "GET" \
+    "$(curl -s -D - -o /dev/null -X POST -H 'Content-Length: 0' "${base_url}/api/videos" |
+        tr -d '\r' | grep -i '^Allow:' | cut -d ' ' -f 2-)"
+expect_equal "목록에 없는 동영상 offer" "404" \
+    "$(status_of '/offer?video=missing.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "잘못된 video 인코딩 offer" "400" \
+    "$(status_of '/offer?video=%zz' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+
 # 요청을 끝내지 않은 연결이 있어도 다른 요청은 바로 처리되어야 한다.
 # nc만 백그라운드 작업으로 두어야 nc를 종료한 뒤 남은 sleep을 기다리지 않는다.
 nc localhost "${port}" < <(printf 'GET / HTTP/1.1\r\n'; sleep 3 2> /dev/null) > /dev/null &
@@ -199,11 +211,46 @@ expect_startup_failure() {
     fi
 }
 
-printf 'this is not an h264 stream\n' > "${work_dir}/not_h264.txt"
+# SPS, PPS, IDR 슬라이스로 이루어진 프레임 하나짜리 H.264 파일을 만든다.
+# $1: 만들 파일 경로
+write_single_frame_video() {
+    printf '\x00\x00\x01\x67\x42\xc0\x1f\xda\x00\x00\x01\x68\xce\x3c\x80\x00\x00\x01\x65\x88\x84\x21\x10' > "$1"
+}
+
+bad_video_dir="${work_dir}/bad_videos"
+mkdir -p "${bad_video_dir}"
+printf 'this is not an h264 stream\n' > "${bad_video_dir}/not_h264.h264"
+printf 'file' > "${work_dir}/plain.txt"
 expect_startup_failure "--video-fps 0" --video-fps 0
 expect_startup_failure "--video-fps abc" --video-fps abc
-expect_startup_failure "없는 --video-file" --video-file "${work_dir}/missing.h264"
-expect_startup_failure "시작 코드 없는 --video-file" --video-file "${work_dir}/not_h264.txt"
+expect_startup_failure "없어진 --video-file" --video-file "${work_dir}/a.h264"
+expect_startup_failure "없는 --video-dir" --video-dir "${work_dir}/missing"
+expect_startup_failure "일반 파일 --video-dir" --video-dir "${work_dir}/plain.txt"
+expect_startup_failure "쓸 수 있는 파일이 없는 --video-dir" --video-dir "${bad_video_dir}"
+
+# 정상 파일과 잘못된 파일이 섞인 디렉터리로 실행하면 잘못된 파일만 건너뛰고 시작해야 한다.
+video_dir="${work_dir}/videos"
+mkdir -p "${video_dir}"
+write_single_frame_video "${video_dir}/b.h264"
+write_single_frame_video "${video_dir}/a.h264"
+printf 'this is not an h264 stream\n' > "${video_dir}/bad.h264"
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --video-dir "${video_dir}" 2>> "${server_log}" &
+server_pid=$!
+for _ in $(seq 50); do
+    if curl -s -o /dev/null "${base_url}/"; then
+        break
+    fi
+    sleep 0.1
+done
+expect_equal "디렉터리의 동영상 목록" '{"videos":[{"id":"a.h264","frames":1},{"id":"b.h264","frames":1}]}' \
+    "$(curl -s "${base_url}/api/videos")"
+expect_equal "목록에 있는 동영상 offer" "200" \
+    "$(status_of '/offer?video=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "잘못된 파일 건너뜀 경고" "1" "$(grep -c '^경고: .*bad\.h264' "${server_log}")"
+kill -TERM "${server_pid}"
+wait "${server_pid}"
+server_pid=""
 
 if (( failure_count > 0 )); then
     echo "--- 서버 로그 ---"

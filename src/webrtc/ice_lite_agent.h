@@ -43,13 +43,7 @@ struct IceLiteAgentConfig {
     std::chrono::milliseconds session_timeout = std::chrono::seconds(30);
 
 
-    // DTLS가 완료된 세션에 보낼 동영상. 비어 있으면 미디어를 보내지 않는다.
-    //
-    // 참조만 하므로 에이전트보다 오래 살아 있어야 한다.
-    const media::H264File* video_file = nullptr;
-
-
-    // 동영상 재생 속도(초당 프레임 수). 1 이상이어야 하며, video_file이 있을 때만 쓴다.
+    // 동영상 재생 속도(초당 프레임 수). 1 이상이어야 하며, 동영상이 지정된 세션에 공통으로 쓴다.
     int video_fps = 30;
 };
 
@@ -67,6 +61,16 @@ struct IceSessionRequest {
 
     // answer에서 정한 H.264 payload type(0~127). 이 세션이 보내는 RTP 헤더에 넣는다.
     std::uint8_t h264_payload_type = 0;
+
+
+    // DTLS가 완료되면 이 세션에 보낼 동영상. nullptr이면 이 세션에는 미디어를 보내지 않는다.
+    //
+    // 참조만 하므로 에이전트보다 오래 살아 있어야 한다. 보통 VideoLibrary의 항목을 가리킨다.
+    const media::H264File* video = nullptr;
+
+
+    // video의 ID. 송신 시작 로그에 쓰며, 세션이 복사해 보관한다. video가 nullptr이면 쓰지 않는다.
+    std::string_view video_id;
 };
 
 
@@ -102,8 +106,8 @@ enum class IceSessionState {
 // 브라우저의 nomination을 받아들이기만 하며, 먼저 요청을 보내지 않는다.
 // 설정한 주소마다 UDP 소켓 하나를 소유하고, 모든 세션이 이 소켓들을 함께 쓴다. 응답은 요청이 도착한
 // 소켓에서 보내 출발 주소가 요청의 목적지와 같게 한다.
-// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 동영상이 설정되어 있으면 DTLS가 완료된
-// 세션마다 VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다.
+// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 동영상이 지정된 세션은 DTLS가 완료되면
+// VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다.
 // 루프 핸들러와 타이머가 이 객체의 주소를 캡처하므로 std::unique_ptr로만 다루며 이동하지 않는다.
 // 연결된 EventLoop와 DtlsContext보다 먼저 소멸해야 한다.
 class IceLiteAgent {
@@ -111,7 +115,7 @@ public:
     // 주소마다 UDP 소켓을 열어 루프에 등록하고 패킷을 받기 시작한다.
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프. 반환된 에이전트보다 오래 살아 있어야 한다.
-    // config: 주소 목록, 포트, 세션 만료 시간, 동영상. 주소가 하나 이상이어야 한다.
+    // config: 주소 목록, 포트, 세션 만료 시간, 재생 속도. 주소가 하나 이상이어야 한다.
     // dtls_context: 세션마다 DtlsTransport를 만들 컨텍스트. 참조만 하므로 반환된 에이전트보다 오래
     //   살아 있어야 한다.
     // 반환값: 시작된 에이전트. 주소가 없거나, 어느 한 주소라도 소켓 생성·바인드·등록에 실패하면
@@ -260,7 +264,15 @@ private:
         std::uint8_t h264_payload_type = 0;
 
 
-        // 동영상 송신 상태. DTLS가 완료되고 동영상이 설정되어 있을 때 만들며, 송신을 멈추면 지운다.
+        // DTLS가 완료되면 보낼 동영상. nullptr이면 미디어를 보내지 않는다. 에이전트보다 오래 산다.
+        const media::H264File* video = nullptr;
+
+
+        // video의 ID. 송신 시작 로그에 쓴다.
+        std::string video_id;
+
+
+        // 동영상 송신 상태. DTLS가 완료되고 동영상이 지정되어 있을 때 만들며, 송신을 멈추면 지운다.
         //
         // 값이 있는 동안 frame_timer_id의 타이머가 걸려 있거나 그 핸들러가 실행 중이다.
         std::unique_ptr<VideoStreamSender> video_stream_sender;
@@ -283,7 +295,7 @@ private:
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프
     // sockets: 소유권을 넘겨받을 소켓 목록
-    // config: 세션 만료 시간과 동영상 설정. 주소와 포트는 쓰지 않는다.
+    // config: 세션 만료 시간과 재생 속도. 주소와 포트는 쓰지 않는다.
     // dtls_context: DtlsTransport를 만들 컨텍스트
     IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets, const IceLiteAgentConfig& config,
                  const crypto::DtlsContext& dtls_context);
@@ -358,7 +370,7 @@ private:
                         DtlsState previous_state);
 
 
-    // DTLS가 완료된 세션의 동영상 송신을 시작한다. 동영상이 설정되지 않았으면 아무것도 하지 않는다.
+    // DTLS가 완료된 세션의 동영상 송신을 시작한다. 세션에 동영상이 지정되지 않았으면 아무것도 하지 않는다.
     //
     // session: kConnected가 된 DtlsTransport를 가진 세션
     //
@@ -432,10 +444,6 @@ private:
 
     // 세션 만료 시간
     std::chrono::milliseconds session_timeout_;
-
-
-    // DTLS가 완료된 세션에 보낼 동영상. 없으면 nullptr이며, 에이전트보다 오래 산다.
-    const media::H264File* video_file_;
 
 
     // 동영상 재생 속도(초당 프레임 수)

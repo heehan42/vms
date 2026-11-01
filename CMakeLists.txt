@@ -16,6 +16,7 @@ find_package(OpenSSL 3.2 REQUIRED)
 # 실행 파일과 테스트가 함께 링크하는 서버 구성 요소
 add_library(server_core STATIC
     src/core/event_loop.cpp
+    src/core/json.cpp
     src/core/network_interfaces.cpp
     src/core/termination_signal_watcher.cpp
     src/crypto/certificate.cpp
@@ -28,8 +29,10 @@ add_library(server_core STATIC
     src/http/http_response.cpp
     src/http/http_server.cpp
     src/http/mime_type.cpp
+    src/http/query_string.cpp
     src/http/static_files.cpp
     src/media/h264_file.cpp
+    src/media/video_library.cpp
     src/webrtc/dtls_transport.cpp
     src/webrtc/h264_packetizer.cpp
     src/webrtc/ice_lite_agent.cpp

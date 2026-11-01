@@ -25,7 +25,7 @@ namespace vms::http {
 inline constexpr std::size_t kMaxRequestBodySize = 64 * 1024;
 
 
-// POST 엔드포인트 핸들러가 돌려주는 응답 내용.
+// GET·POST 엔드포인트 핸들러가 돌려주는 응답 내용.
 struct HttpEndpointResponse {
     // 응답 상태 코드
     HttpStatus status = HttpStatus::kOk;
@@ -61,6 +61,33 @@ using HttpPostHandler =
 using HttpPostHandlers = std::unordered_map<std::string, HttpPostHandler>;
 
 
+// GET 엔드포인트 핸들러.
+//
+// 헤더를 파싱한 요청을 인자로 받는다. 요청 대상에는 쿼리 문자열이 그대로 남아 있다.
+// 이벤트 루프 스레드에서 동기적으로 호출되므로 오래 걸리는 작업을 하면 안 된다.
+using HttpGetHandler = std::move_only_function<HttpEndpointResponse(const HttpRequest& request)>;
+
+
+// 요청 경로(쿼리 문자열 제외)를 키로 하는 GET 엔드포인트 핸들러 표. 예: "/api/videos"
+//
+// 표에 있는 경로는 웹 루트에 같은 경로의 파일이 있어도 핸들러가 응답한다.
+using HttpGetHandlers = std::unordered_map<std::string, HttpGetHandler>;
+
+
+// 서버가 정적 파일 대신 핸들러로 응답할 엔드포인트 표.
+//
+// 한 경로는 get과 post 중 한쪽에만 등록해야 한다. 두 표에 모두 있으면 POST 엔드포인트로 취급한다.
+// 서버가 시작한 뒤에는 표를 바꾸지 않으므로, 연결이 보관한 핸들러 포인터는 서버 수명 동안 유효하다.
+struct HttpEndpoints {
+    // GET 엔드포인트 핸들러 표
+    HttpGetHandlers get;
+
+
+    // POST 엔드포인트 핸들러 표
+    HttpPostHandlers post;
+};
+
+
 // HTTP 서버 실행 설정.
 struct HttpServerConfig {
     // 연결을 받을 TCP 포트. 모든 네트워크 인터페이스(0.0.0.0)에서 받는다.
@@ -74,8 +101,8 @@ struct HttpServerConfig {
 
 // 이벤트 루프 위에서 TCP 연결을 받아 요청 하나에 응답하고 연결을 닫는 HTTP/1.1 서버.
 //
-// 등록된 POST 경로는 본문을 받아 해당 핸들러로, 그 밖의 경로는 GET 요청만 웹 루트의 정적 파일로
-// 응답하고, 처리할 수 없는 요청에는 오류 상태 코드로 응답한다.
+// 등록된 POST 경로는 본문을 받아 해당 핸들러로, 등록된 GET 경로는 해당 핸들러로, 그 밖의 경로는 GET
+// 요청만 웹 루트의 정적 파일로 응답하고, 처리할 수 없는 요청에는 오류 상태 코드로 응답한다.
 // 리스닝 소켓과 모든 연결 소켓을 소유하며, 소멸할 때 루프 등록을 해제하고 닫는다.
 // 루프 핸들러가 이 객체의 주소를 캡처하므로 std::unique_ptr로만 다루며 이동하지 않는다.
 // 연결된 EventLoop보다 먼저 소멸해야 한다.
@@ -85,11 +112,12 @@ public:
     //
     // loop: 소켓을 등록할 이벤트 루프. 반환된 서버보다 오래 살아 있어야 한다.
     // config: 포트와 웹 루트. web_root는 존재하는 디렉터리라고 가정한다.
-    // post_handlers: POST 엔드포인트 핸들러 표. 서버가 소유하며, 핸들러가 참조하는 객체는
+    // endpoints: GET·POST 엔드포인트 핸들러 표. 서버가 소유하며, 핸들러가 참조하는 객체는
     //   서버보다 오래 살아 있어야 한다.
     // 반환값: 시작된 서버. 소켓 생성, bind(포트 사용 중 등), listen, 등록에 실패하면 시스템 오류 코드
-    static std::expected<std::unique_ptr<HttpServer>, std::error_code> Start(
-        core::EventLoop& loop, HttpServerConfig config, HttpPostHandlers post_handlers = {});
+    static std::expected<std::unique_ptr<HttpServer>, std::error_code> Start(core::EventLoop& loop,
+                                                                             HttpServerConfig config,
+                                                                             HttpEndpoints endpoints = {});
 
 
     // 모든 소켓의 루프 등록을 해제하고 닫는다. 처리 중이던 응답은 보내지 않고 버린다.
@@ -123,9 +151,9 @@ private:
     //
     // loop: 소켓을 등록할 이벤트 루프
     // config: 실행 설정
-    // post_handlers: 소유권을 넘겨받을 POST 엔드포인트 핸들러 표
+    // endpoints: 소유권을 넘겨받을 엔드포인트 핸들러 표
     // listen_socket: 소유권을 넘겨받을 리스닝 소켓
-    HttpServer(core::EventLoop& loop, HttpServerConfig config, HttpPostHandlers post_handlers,
+    HttpServer(core::EventLoop& loop, HttpServerConfig config, HttpEndpoints endpoints,
                core::UniqueFd listen_socket);
 
 
@@ -148,7 +176,7 @@ private:
     // 반환값: 피어가 먼저 닫았거나 읽기 오류가 나면 kClose
     //
     // 헤더가 완성되면 라우팅을 결정한다. 본문을 기다려야 하면 kReceivingBody로 바꾸고,
-    // 본문 없이 응답할 수 있으면(정적 파일, 조기 오류) 바로 송신 상태로 바꾼다.
+    // 본문 없이 응답할 수 있으면(GET 엔드포인트, 정적 파일, 조기 오류) 바로 송신 상태로 바꾼다.
     ConnectionAction ReceiveRequest(Connection& connection);
 
 
@@ -169,11 +197,11 @@ private:
 
     // 헤더 단계의 라우팅 결과. 두 필드 중 정확히 하나만 값이 있다.
     struct RouteDecision {
-        // 본문 없이 바로 보낼 응답 바이트(정적 파일, 조기 오류)
+        // 본문 없이 바로 보낼 응답 바이트(GET 엔드포인트, 정적 파일, 조기 오류)
         std::optional<std::string> immediate_response;
 
 
-        // 본문을 받은 뒤 호출할 POST 핸들러. post_handlers_ 안의 값을 가리킨다.
+        // 본문을 받은 뒤 호출할 POST 핸들러. endpoints_.post 안의 값을 가리킨다.
         HttpPostHandler* post_handler = nullptr;
     };
 
@@ -183,8 +211,9 @@ private:
     // request: 파싱한 요청 헤더
     // 반환값: 바로 보낼 응답 바이트, 또는 본문을 받은 뒤 호출할 POST 핸들러
     //
-    // 응답을 만들면 요청 로그를 남긴다. 판정 순서는 메서드(405), 전송 인코딩(501),
-    // 본문 크기(413), 정적 파일, 본문 길이 유무(411)다.
+    // 응답을 만들면 요청 로그를 남긴다. 허용 메서드는 POST 표에 있으면 POST, 그 밖에는 GET이다.
+    // 판정 순서는 메서드(405), 전송 인코딩(501), 본문 크기(413), GET 엔드포인트, 정적 파일,
+    // 본문 길이 유무(411)다.
     RouteDecision RouteRequestHeader(const HttpRequest& request);
 
 
@@ -205,6 +234,14 @@ private:
                                        std::string_view body);
 
 
+    // GET 요청을 핸들러로 처리해 응답 바이트를 만들고 요청 로그를 남긴다.
+    //
+    // handler: RouteRequestHeader가 고른 핸들러
+    // request: 핸들러 경로로 온 GET 요청
+    // 반환값: 핸들러 결과로 만든 응답 바이트
+    static std::string CallGetHandler(HttpGetHandler& handler, const HttpRequest& request);
+
+
     // 연결의 루프 등록을 해제하고 소켓을 닫는다.
     //
     // socket_fd: 닫을 연결 소켓
@@ -221,8 +258,8 @@ private:
     HttpServerConfig config_;
 
 
-    // POST 엔드포인트 핸들러 표. 키는 쿼리 문자열을 뺀 요청 경로다.
-    HttpPostHandlers post_handlers_;
+    // GET·POST 엔드포인트 핸들러 표. 키는 쿼리 문자열을 뺀 요청 경로다.
+    HttpEndpoints endpoints_;
 
 
     // 연결을 받는 리스닝 소켓

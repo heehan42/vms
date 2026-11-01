@@ -5,11 +5,14 @@
 #include <charconv>
 #include <cstdint>
 #include <format>
+#include <iterator>
 #include <print>
 #include <string>
 
 #include "core/ascii.h"
+#include "core/json.h"
 #include "crypto/random.h"
+#include "http/query_string.h"
 #include "webrtc/sdp.h"
 
 
@@ -73,11 +76,41 @@ std::expected<std::uint8_t, std::string> ParsePayloadType(std::string_view paylo
 }
 
 
+// offer 요청의 video 쿼리 매개변수로 세션에 보낼 동영상을 찾는다.
+//
+// target: 요청 대상 원문
+// video_library: 찾을 동영상 목록
+// 반환값: 찾은 항목. video가 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404(원인을 로그에 남김)
+//
+// 디코딩한 값은 목록 ID와 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도 목록에 없어 404가 된다.
+std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedVideo(std::string_view target,
+                                                                            const media::VideoLibrary& video_library) {
+    const auto video_id = http::FindQueryParameter(target, "video");
+    if (!video_id) {
+        std::println(stderr, "offer 거부: video 매개변수 해석 실패 ({}): {}", target,
+                     video_id.error() == http::QueryParameterError::kDuplicate ? "두 번 이상 옴"
+                                                                               : "잘못된 퍼센트 인코딩");
+        return std::unexpected(http::HttpStatus::kBadRequest);
+    }
+    if (!*video_id) {
+        return nullptr;
+    }
+
+    const media::VideoEntry* const entry = video_library.Find(**video_id);
+    if (entry == nullptr) {
+        std::println(stderr, "offer 거부: 목록에 없는 동영상 ({})", target);
+        return std::unexpected(http::HttpStatus::kNotFound);
+    }
+    return entry;
+}
+
+
 }  // namespace
 
 
-Signaling::Signaling(IceLiteAgent& agent, const crypto::Certificate& certificate)
-    : agent_(agent), certificate_(certificate) {}
+Signaling::Signaling(IceLiteAgent& agent, const crypto::Certificate& certificate,
+                     const media::VideoLibrary& video_library)
+    : agent_(agent), certificate_(certificate), video_library_(video_library) {}
 
 
 http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& request,
@@ -86,6 +119,12 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
         std::println(stderr, "offer 거부: Content-Type이 application/sdp가 아님 ({})",
                      request.content_type);
         return http::HttpEndpointResponse::Error(http::HttpStatus::kUnsupportedMediaType);
+    }
+
+    // 동영상 확인은 SDP 해석보다 가벼우므로 먼저 한다.
+    const auto video = FindRequestedVideo(request.target, video_library_);
+    if (!video) {
+        return http::HttpEndpointResponse::Error(video.error());
     }
 
     const auto description = ParseSdp(body);
@@ -108,7 +147,9 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
                             : std::expected<std::string, std::string>(std::unexpected(session_id.error()));
     auto session = cname ? agent_.CreateSession(IceSessionRequest{.remote_ufrag = offer->ice_ufrag,
                                                                   .remote_fingerprint = offer->remote_fingerprint,
-                                                                  .h264_payload_type = *payload_type})
+                                                                  .h264_payload_type = *payload_type,
+                                                                  .video = *video ? &(*video)->file : nullptr,
+                                                                  .video_id = *video ? (*video)->id : ""})
                          : std::expected<IceSessionParameters, std::string>(std::unexpected(cname.error()));
     if (!session) {
         std::println(stderr, "ICE 세션 생성 실패: {}", session.error());
@@ -126,11 +167,28 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     parameters.media_stream_id = kMediaStreamId;
     parameters.track_id = kVideoTrackId;
 
-    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}",
-                 session->ice_ufrag, offer->ice_ufrag, *payload_type, session->ssrc);
+    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}, 동영상 {}",
+                 session->ice_ufrag, offer->ice_ufrag, *payload_type, session->ssrc,
+                 *video ? std::string_view((*video)->id) : "없음");
     return http::HttpEndpointResponse{.status = http::HttpStatus::kOk,
                                       .content_type = "application/sdp",
                                       .body = BuildSdpAnswer(*offer, parameters)};
+}
+
+
+http::HttpEndpointResponse Signaling::HandleVideoList() const {
+    std::string body = R"({"videos":[)";
+    for (const media::VideoEntry& entry : video_library_.Entries()) {
+        if (&entry != &video_library_.Entries().front()) {
+            body.push_back(',');
+        }
+        body.append(R"({"id":)");
+        core::AppendJsonString(body, entry.id);
+        std::format_to(std::back_inserter(body), R"(,"frames":{}}})", entry.file.Frames().size());
+    }
+    body.append("]}");
+    return http::HttpEndpointResponse{
+        .status = http::HttpStatus::kOk, .content_type = "application/json", .body = std::move(body)};
 }
 
 

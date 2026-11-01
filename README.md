@@ -4,7 +4,7 @@
 먼저 서버의 동영상 파일을 웹 사이트에서 WebRTC로 재생하는 기능부터 구현하고 있으며,
 현재는 웹 페이지를 제공하는 HTTP 서버, 브라우저와 ICE 연결을 맺는 시그널링·ICE-lite, 그 연결 위에서
 SRTP 키를 정하는 DTLS 핸드셰이크, 그리고 서버의 H.264 파일을 RTP로 패킷화해 SRTP로 보내는 송신까지 구현되어 있습니다.
-브라우저 페이지에서 연결하면 `--video-file`로 지정한 영상이 반복 재생됩니다.
+브라우저 페이지에서 `--video-dir`로 지정한 디렉터리의 동영상을 골라 연결하면 그 영상이 반복 재생됩니다.
 
 ## 필요한 도구
 
@@ -54,8 +54,8 @@ http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 | `--web-root` | `./web` | 정적 파일 디렉터리 |
 | `--ice-port` | 50000 | ICE용 UDP 포트 |
 | `--ice-address` | 자동 조회 | candidate로 알리고 UDP 소켓을 바인드할 IPv4 주소. 여러 번 쓸 수 있으며, 쓴 순서대로 우선순위가 높습니다 |
-| `--video-file` | 없음 | 브라우저에 보낼 H.264 Annex-B 파일(최대 64MiB). 없으면 연결 확인까지만 하고 영상은 보내지 않습니다 |
-| `--video-fps` | 30 | 영상 재생 속도(1~120). 파일을 만들 때의 프레임 속도와 같게 지정합니다 |
+| `--video-dir` | 없음 | 재생할 H.264 Annex-B 파일(`.h264`, `.264`)이 든 디렉터리. 없으면 연결 확인까지만 하고 영상은 보내지 않습니다 |
+| `--video-fps` | 30 | 영상 재생 속도(1~120). 디렉터리의 모든 파일에 적용하므로 파일을 만들 때의 프레임 속도와 같게 지정합니다 |
 
 `--ice-address`를 주지 않으면 켜져 있고 루프백이 아닌 인터페이스의 IPv4 주소를 모두 씁니다.
 이 머신에 없는 주소(예: 공유기의 공인 IP)는 바인드할 수 없으므로 지금은 같은 PC나 같은 내부 네트워크의
@@ -69,12 +69,22 @@ http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 
 ### 테스트 영상 만들기
 
-ffmpeg의 내장 테스트 패턴으로 10초 길이의 720p 30fps H.264 파일을 만듭니다.
+ffmpeg의 내장 테스트 패턴으로 10초 길이의 720p 30fps H.264 파일 두 개를 `videos` 디렉터리에 만듭니다.
 영상 파일은 저장소에 커밋하지 않습니다.
 
 ```bash
-ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v baseline -level 3.1 -pix_fmt yuv420p -g 30 -bf 0 -x264-params repeat-headers=1 -f h264 test_pattern.h264
+mkdir -p videos
 ```
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v baseline -level 3.1 -pix_fmt yuv420p -g 30 -bf 0 -x264-params repeat-headers=1 -f h264 videos/test_pattern.h264
+```
+
+```bash
+ffmpeg -f lavfi -i smptebars=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v baseline -level 3.1 -pix_fmt yuv420p -g 30 -bf 0 -x264-params repeat-headers=1 -f h264 videos/color_bars.h264
+```
+
+두 번째 명령은 입력만 `smptebars`(정지한 컬러 바)로 바꾼 것입니다. 옵션의 의미는 다음과 같습니다.
 
 | 옵션 | 의미 |
 |---|---|
@@ -86,18 +96,26 @@ ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v 
 | `-x264-params repeat-headers=1` | 키프레임마다 SPS·PPS 반복 |
 | `-f h264` | 컨테이너 없는 Annex-B 원시 스트림 출력 |
 
-만든 파일을 지정해 서버를 실행합니다.
+만든 디렉터리를 지정해 서버를 실행합니다.
 
 ```bash
-./build/vms_web_server --video-file test_pattern.h264 --video-fps 30
+./build/vms_web_server --video-dir videos --video-fps 30
 ```
 
-시작 로그에 파일 경로, 프레임 수, fps가 나옵니다. 파일을 읽을 수 없거나, 시작 코드가 없거나,
-첫 프레임에 SPS·PPS·IDR이 모두 있지 않으면 원인을 출력하고 시작하지 않습니다.
+서버는 시작할 때 디렉터리 바로 아래의 `.h264`·`.264` 파일을 이름순으로 모두 읽어 동영상 목록을 만들고,
+파일 이름을 동영상 ID로 씁니다. 시작 로그에 동영상마다 ID와 프레임 수, 마지막에 동영상 수와 fps가 나옵니다.
 
 ```text
-동영상 파일 로드: test_pattern.h264, 프레임 300, 30fps
+동영상 로드: color_bars.h264, 프레임 300
+동영상 로드: test_pattern.h264, 프레임 300
+동영상 목록: 2개, 30fps (videos)
 ```
+
+- 파일을 읽을 수 없거나, 시작 코드가 없거나, 첫 프레임에 SPS·PPS·IDR이 모두 있지 않거나, 이름이 UTF-8이
+  아닌 파일은 `경고: ...`를 남기고 건너뜁니다. 파일 하나는 64MiB, 목록 전체는 256MiB까지 읽습니다.
+- 쓸 수 있는 파일이 하나도 없거나 디렉터리가 아니면 원인을 출력하고 시작하지 않습니다.
+- fps는 모든 파일에 같은 값을 쓰므로, 같은 fps로 만든 파일만 디렉터리에 둡니다. 다르면 빠르거나 느리게 재생됩니다.
+- 디렉터리는 시작할 때 한 번만 읽습니다. 파일을 추가하거나 지웠으면 서버를 다시 시작합니다.
 
 ## WSL2에서 실행하기
 
@@ -114,7 +132,9 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
 
 1. 서버를 실행하고 Windows Chrome에서 `http://localhost:8080/`에 접속합니다.
    "app.js가 실행되었습니다." 문구가 보이면 페이지와 스크립트가 정상적으로 전달된 것입니다.
-2. **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
+   **동영상** 선택 목록에는 서버의 동영상이 이름순으로 나오고 첫 동영상이 선택되어 있습니다.
+   `--video-dir` 없이 실행했으면 "동영상 없음"이 표시되며, 연결은 영상 없이 맺어집니다.
+2. 동영상을 고르고 **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
    서버 로그에는 `ICE 연결됨: ...`이 남습니다.
 3. 이어서 DTLS 핸드셰이크가 끝나면 연결 상태(`connectionState`)가 `connected`가 되고,
    페이지에 DTLS 상태 `connected`와 SRTP 암호 `SRTP_AES128_CM_HMAC_SHA1_80`이 표시됩니다.
@@ -127,8 +147,9 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
    | `dtlsRole` | `client` | 서버가 answer에서 `a=setup:passive`로 DTLS 서버를 맡으므로 브라우저는 클라이언트 |
    | `srtpCipher` | `SRTP_AES128_CM_HMAC_SHA1_80` | 협상한 SRTP 프로파일 |
 
-5. `--video-file`을 지정했다면 페이지의 영상 영역에 테스트 패턴이 움직이며 표시되고, 파일 끝에서 처음부터 반복됩니다.
-   서버 로그에는 `송신 시작: 세션 ..., SSRC ..., payload type ...`이 남습니다.
+5. 동영상을 골랐다면 페이지의 영상 영역에 그 동영상이 표시되고, 파일 끝에서 처음부터 반복됩니다.
+   서버 로그에는 `송신 시작: 세션 ..., 동영상 <ID>, SSRC ..., payload type ...`이 남습니다.
+   다른 동영상을 보려면 목록에서 고른 뒤 **연결** 버튼을 다시 누릅니다. 새 연결을 맺어 처음부터 재생합니다.
    `chrome://webrtc-internals`의 inbound-rtp(video) 통계에서 다음을 확인합니다.
 
    | 항목 | 기대값 | 의미 |

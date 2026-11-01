@@ -129,7 +129,7 @@ struct HttpServer::Connection {
 
 
 std::expected<std::unique_ptr<HttpServer>, std::error_code> HttpServer::Start(
-    core::EventLoop& loop, HttpServerConfig config, HttpPostHandlers post_handlers) {
+    core::EventLoop& loop, HttpServerConfig config, HttpEndpoints endpoints) {
     auto listen_socket = OpenListenSocket(config.port);
     if (!listen_socket) {
         return std::unexpected(listen_socket.error());
@@ -137,7 +137,7 @@ std::expected<std::unique_ptr<HttpServer>, std::error_code> HttpServer::Start(
 
     // 핸들러가 서버 주소를 캡처하므로, 주소가 고정되는 힙 객체를 만든 뒤 등록한다.
     std::unique_ptr<HttpServer> server(new HttpServer(
-        loop, std::move(config), std::move(post_handlers), *std::move(listen_socket)));
+        loop, std::move(config), std::move(endpoints), *std::move(listen_socket)));
     HttpServer* const server_address = server.get();
     const std::error_code add_error =
         loop.Add(server->listen_socket_.Get(), EPOLLIN,
@@ -149,11 +149,11 @@ std::expected<std::unique_ptr<HttpServer>, std::error_code> HttpServer::Start(
 }
 
 
-HttpServer::HttpServer(core::EventLoop& loop, HttpServerConfig config,
-                       HttpPostHandlers post_handlers, core::UniqueFd listen_socket)
+HttpServer::HttpServer(core::EventLoop& loop, HttpServerConfig config, HttpEndpoints endpoints,
+                       core::UniqueFd listen_socket)
     : loop_(loop),
       config_(std::move(config)),
-      post_handlers_(std::move(post_handlers)),
+      endpoints_(std::move(endpoints)),
       listen_socket_(std::move(listen_socket)) {}
 
 
@@ -324,8 +324,9 @@ HttpServer::RouteDecision HttpServer::RouteRequestHeader(const HttpRequest& requ
                              .post_handler = nullptr};
     };
 
-    const auto found = post_handlers_.find(std::string(RequestPath(request.target)));
-    const bool is_post_endpoint = found != post_handlers_.end();
+    const std::string path(RequestPath(request.target));
+    const auto found = endpoints_.post.find(path);
+    const bool is_post_endpoint = found != endpoints_.post.end();
     const std::string_view allowed_method = is_post_endpoint ? "POST" : "GET";
     if (request.method != allowed_method) {
         const std::array allow_header = {HttpHeader{"Allow", allowed_method}};
@@ -338,10 +339,12 @@ HttpServer::RouteDecision HttpServer::RouteRequestHeader(const HttpRequest& requ
         return respond_error(HttpStatus::kContentTooLarge);
     }
 
-    // 정적 파일 요청에 붙은 본문은 쓰지 않으므로 받지 않고 바로 응답한다.
+    // GET 요청에 붙은 본문은 쓰지 않으므로 받지 않고 바로 응답한다.
     if (!is_post_endpoint) {
-        return RouteDecision{.immediate_response = BuildStaticFileResponse(request),
-                             .post_handler = nullptr};
+        const auto get_handler = endpoints_.get.find(path);
+        std::string response = get_handler != endpoints_.get.end() ? CallGetHandler(get_handler->second, request)
+                                                                   : BuildStaticFileResponse(request);
+        return RouteDecision{.immediate_response = std::move(response), .post_handler = nullptr};
     }
     if (!request.content_length) {
         return respond_error(HttpStatus::kLengthRequired);
@@ -379,6 +382,13 @@ HttpEndpointResponse HttpEndpointResponse::Error(HttpStatus status) {
 std::string HttpServer::CallPostHandler(HttpPostHandler& handler, const HttpRequest& request,
                                         std::string_view body) {
     const HttpEndpointResponse result = handler(request, body);
+    LogRequest(request, result.status);
+    return BuildResponse(result.status, result.content_type, result.body);
+}
+
+
+std::string HttpServer::CallGetHandler(HttpGetHandler& handler, const HttpRequest& request) {
+    const HttpEndpointResponse result = handler(request);
     LogRequest(request, result.status);
     return BuildResponse(result.status, result.content_type, result.body);
 }

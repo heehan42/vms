@@ -18,7 +18,7 @@
 #include "crypto/certificate.h"
 #include "crypto/dtls_context.h"
 #include "http/http_server.h"
-#include "media/h264_file.h"
+#include "media/video_library.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_lite_agent.h"
 #include "webrtc/signaling.h"
@@ -32,7 +32,7 @@ using vms::crypto::DtlsContext;
 using vms::http::HttpRequest;
 using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
-using vms::media::H264File;
+using vms::media::VideoLibrary;
 using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
@@ -46,7 +46,7 @@ namespace {
 constexpr std::string_view kUsage =
     "사용법: vms_web_server [--port <1-65535>] [--web-root <디렉터리>]\n"
     "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...\n"
-    "                      [--video-file <H.264 Annex-B 파일>] [--video-fps <1-120>]";
+    "                      [--video-dir <H.264 Annex-B 파일 디렉터리>] [--video-fps <1-120>]";
 
 
 // --video-fps를 생략했을 때의 재생 속도
@@ -71,11 +71,11 @@ struct ServerOptions {
     std::vector<in_addr> ice_addresses;
 
 
-    // --video-file로 지정한 동영상 파일. 비어 있으면 미디어를 보내지 않는다.
-    std::optional<fs::path> video_file;
+    // --video-dir로 지정한 동영상 디렉터리. 비어 있으면 동영상 없이 실행하며 미디어를 보내지 않는다.
+    std::optional<fs::path> video_dir;
 
 
-    // 동영상 재생 속도(초당 프레임 수)
+    // 동영상 재생 속도(초당 프레임 수). 목록의 모든 동영상에 적용한다.
     int video_fps = kDefaultVideoFps;
 };
 
@@ -124,7 +124,7 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const std::string_view option = arguments[index];
         if (option != "--port" && option != "--web-root" && option != "--ice-port" &&
-            option != "--ice-address" && option != "--video-file" && option != "--video-fps") {
+            option != "--ice-address" && option != "--video-dir" && option != "--video-fps") {
             return std::unexpected(std::format("알 수 없는 인자: {}", option));
         }
         if (index + 1 >= arguments.size()) {
@@ -140,8 +140,8 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             (option == "--port" ? options.http.port : options.ice_port) = *port;
         } else if (option == "--web-root") {
             options.http.web_root = value;
-        } else if (option == "--video-file") {
-            options.video_file = fs::path(value);
+        } else if (option == "--video-dir") {
+            options.video_dir = fs::path(value);
         } else if (option == "--video-fps") {
             const auto fps = ParseVideoFps(value);
             if (!fps) {
@@ -226,17 +226,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 파일 오류는 서버를 띄우기 전에 알리고, 에이전트가 참조하므로 에이전트보다 먼저 만들어 나중에 소멸하게 한다.
-    std::optional<H264File> video_file;
-    if (options->video_file) {
-        auto loaded = H264File::Load(*options->video_file);
+    // 목록 오류는 서버를 띄우기 전에 알린다. 세션이 목록의 파일을 참조하므로 에이전트보다 먼저 만들어
+    // 나중에 소멸하게 한다.
+    VideoLibrary video_library;
+    if (options->video_dir) {
+        auto loaded = VideoLibrary::LoadDirectory(*options->video_dir);
         if (!loaded) {
             std::println(stderr, "{}", loaded.error());
             return 1;
         }
-        video_file = *std::move(loaded);
-        std::println(stderr, "동영상 파일 로드: {}, 프레임 {}, {}fps", options->video_file->string(),
-                     video_file->Frames().size(), options->video_fps);
+        for (const std::string& warning : loaded->warnings) {
+            std::println(stderr, "경고: {}", warning);
+        }
+        video_library = std::move(loaded->library);
+        for (const auto& entry : video_library.Entries()) {
+            std::println(stderr, "동영상 로드: {}, 프레임 {}", entry.id, entry.file.Frames().size());
+        }
+        std::println(stderr, "동영상 목록: {}개, {}fps ({})", video_library.Entries().size(), options->video_fps,
+                     options->video_dir->string());
     }
 
     auto loop = EventLoop::Create();
@@ -274,7 +281,6 @@ int main(int argc, char* argv[]) {
     auto ice_agent = IceLiteAgent::Start(*loop,
                                          IceLiteAgentConfig{.addresses = *std::move(ice_addresses),
                                                             .port = options->ice_port,
-                                                            .video_file = video_file ? &*video_file : nullptr,
                                                             .video_fps = options->video_fps},
                                          *dtls_context);
     if (!ice_agent) {
@@ -286,14 +292,16 @@ int main(int argc, char* argv[]) {
     }
 
     // 웹 서버의 /offer 핸들러가 같은 프로세스의 ICE-lite 에이전트를 직접 호출한다.
-    // 소멸은 선언 역순이므로 HttpServer가 Signaling보다, Signaling이 에이전트와 인증서보다 먼저 사라진다.
-    Signaling signaling(**ice_agent, *certificate);
-    vms::http::HttpPostHandlers post_handlers;
-    post_handlers.emplace("/offer", [&signaling](const HttpRequest& request, std::string_view body) {
+    // 소멸은 선언 역순이므로 HttpServer가 Signaling보다, Signaling이 에이전트, 인증서, 동영상 목록보다
+    // 먼저 사라진다.
+    Signaling signaling(**ice_agent, *certificate, video_library);
+    vms::http::HttpEndpoints endpoints;
+    endpoints.post.emplace("/offer", [&signaling](const HttpRequest& request, std::string_view body) {
         return signaling.HandleOffer(request, body);
     });
+    endpoints.get.emplace("/api/videos", [&signaling](const HttpRequest&) { return signaling.HandleVideoList(); });
 
-    auto server = HttpServer::Start(*loop, options->http, std::move(post_handlers));
+    auto server = HttpServer::Start(*loop, options->http, std::move(endpoints));
     if (!server) {
         std::println(stderr, "서버 시작 실패 (포트 {}): {}", options->http.port,
                      server.error().message());

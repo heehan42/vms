@@ -211,7 +211,6 @@ IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> socke
     : loop_(loop),
       dtls_context_(dtls_context),
       session_timeout_(config.session_timeout),
-      video_file_(config.video_file),
       video_fps_(config.video_fps),
       sockets_(std::move(sockets)) {
     for (std::size_t index = 0; index < sockets_.size(); ++index) {
@@ -277,6 +276,8 @@ std::expected<IceSessionParameters, std::string> IceLiteAgent::CreateSession(
     session.remote_fingerprint = request.remote_fingerprint;
     session.ssrc = ssrc;
     session.h264_payload_type = request.h264_payload_type;
+    session.video = request.video;
+    session.video_id = request.video != nullptr ? std::string(request.video_id) : std::string();
     session.last_activity_time = std::chrono::steady_clock::now();
     session.expiry_timer_id = ScheduleExpiryCheck(local_ufrag, session_timeout_);
     sessions_.emplace(local_ufrag, std::move(session));
@@ -550,18 +551,18 @@ void IceLiteAgent::FinishDtlsStep(SessionIterator session, const std::vector<Dat
 
 
 void IceLiteAgent::StartVideoStream(SessionIterator session) {
-    if (video_file_ == nullptr) {
-        return;
-    }
     const std::string& local_ufrag = session->first;
     Session& state = session->second;
+    if (state.video == nullptr) {
+        return;
+    }
     const std::string remote_text = core::FormatIpv4Endpoint(state.nominated_pair->remote_endpoint);
 
     // kConnected가 된 DtlsTransport는 항상 키 재료를 가진다. 서버가 보내는 패킷은 서버용(local) 키를 쓴다.
     const SrtpKeyMaterial& keys = *state.dtls_transport->SrtpKeys();
     const VideoStreamSenderConfig config{
         .frames_per_second = video_fps_, .ssrc = state.ssrc, .payload_type = state.h264_payload_type};
-    auto sender = VideoStreamSender::Create(*video_file_, config, keys.local_key, keys.local_salt,
+    auto sender = VideoStreamSender::Create(*state.video, config, keys.local_key, keys.local_salt,
                                             std::chrono::steady_clock::now());
     if (!sender) {
         std::println(stderr, "송신 시작 실패: 세션 {}, 브라우저 {}: {}. 이 세션은 미디어를 보내지 않음", local_ufrag,
@@ -571,8 +572,8 @@ void IceLiteAgent::StartVideoStream(SessionIterator session) {
     state.video_stream_sender = *std::move(sender);
     state.frame_timer_id =
         loop_.AddTimer(std::chrono::milliseconds(0), [this, local_ufrag] { HandleFrameTimer(local_ufrag); });
-    std::println(stderr, "송신 시작: 세션 {}, 브라우저 {}, SSRC {}, payload type {}", local_ufrag, remote_text,
-                 state.ssrc, state.h264_payload_type);
+    std::println(stderr, "송신 시작: 세션 {}, 브라우저 {}, 동영상 {}, SSRC {}, payload type {}", local_ufrag,
+                 remote_text, state.video_id, state.ssrc, state.h264_payload_type);
 }
 
 

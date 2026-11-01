@@ -11,7 +11,13 @@
     <p id="script-status">app.js를 불러오지 못했습니다.</p>
 
     <h2>연결 확인</h2>
-    <button id="connect-button" type="button">연결</button>
+    <!-- app.js가 GET /api/videos로 받은 목록으로 option 요소를 채운다. 연결 버튼을 누르면 고른 동영상으로
+         새 연결을 맺는다. 목록 요청이 끝나기 전에 동영상 없이 연결되지 않도록 버튼은 비활성 상태로 시작한다. -->
+    <label for="video-select">동영상</label>
+    <select id="video-select" disabled>
+        <option value="">목록을 불러오는 중</option>
+    </select>
+    <button id="connect-button" type="button" disabled>연결</button>
     <!-- ICE 상태가 connected가 된 뒤 DTLS 핸드셰이크가 끝나면 연결 상태가 connected가 된다.
          DTLS 상태와 SRTP 암호는 연결 상태가 connected가 되었을 때 transport 통계에서 읽는다. -->
     <dl>

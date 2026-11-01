@@ -1,1 +1,2 @@
 add_unit_test(h264_file_test)
+add_unit_test(video_library_test)
