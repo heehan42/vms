@@ -3,18 +3,26 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "srtcp_test_sender.h"
 #include "srtp_test_receiver.h"
 #include "test_support.h"
 
+using vms::crypto::DeriveSrtcpSessionKeys;
 using vms::crypto::DeriveSrtpSessionKeys;
+using vms::crypto::SrtcpReceiver;
+using vms::crypto::SrtcpUnprotectError;
+using vms::crypto::SrtcpUnprotectFailure;
 using vms::crypto::SrtpSender;
 using vms::crypto::XorAesCmKeystream;
 using vms::test::Expect;
+using vms::test::SrtcpTestSender;
 using vms::test::SrtpTestReceiver;
 
 
@@ -106,6 +114,40 @@ void TestRfc3711KeyDerivation() {
     Expect(ToHex(keys->authentication_key) == "CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4",
            "B.3 인증 키(앞 20바이트)");
     Expect(ToHex(keys->salt) == "30CBBC08863D8C85D49DB34A9AE1", "B.3 세션 솔트");
+}
+
+
+// 레이블로 직접 IV를 만들어 마스터 키의 AES-CM 키스트림을 구한다(키 유도 주기 0).
+//
+// label: 키 유도 레이블. 마스터 솔트의 바이트 7에 XOR한다.
+// 반환값: 앞에서부터 Size바이트의 키스트림. 실패하면 0으로 채운 배열
+template <std::size_t Size>
+std::array<std::uint8_t, Size> ExpectedSessionKey(std::uint8_t label) {
+    std::array<std::uint8_t, 16> iv{};
+    std::ranges::copy(kMasterSalt, iv.begin());
+    iv[7] ^= label;
+    std::array<std::uint8_t, Size> keystream{};
+    if (!XorAesCmKeystream(kMasterKey, iv, keystream)) {
+        return {};
+    }
+    return keystream;
+}
+
+
+// SRTCP 세션 키는 레이블 0x03~0x05의 키스트림과 같고 SRTP 세션 키와 다르다.
+void TestSrtcpKeyDerivation() {
+    const auto srtp_keys = DeriveSrtpSessionKeys(kMasterKey, kMasterSalt);
+    const auto srtcp_keys = DeriveSrtcpSessionKeys(kMasterKey, kMasterSalt);
+    if (!srtp_keys || !srtcp_keys) {
+        Expect(false, "SRTP·SRTCP 세션 키 유도가 성공해야 한다");
+        return;
+    }
+    Expect(srtcp_keys->encryption_key == ExpectedSessionKey<16>(0x03), "SRTCP 암호화 키는 레이블 0x03");
+    Expect(srtcp_keys->authentication_key == ExpectedSessionKey<20>(0x04), "SRTCP 인증 키는 레이블 0x04");
+    Expect(srtcp_keys->salt == ExpectedSessionKey<14>(0x05), "SRTCP 세션 솔트는 레이블 0x05");
+    Expect(srtcp_keys->encryption_key != srtp_keys->encryption_key, "SRTCP 암호화 키는 SRTP와 다름");
+    Expect(srtcp_keys->authentication_key != srtp_keys->authentication_key, "SRTCP 인증 키는 SRTP와 다름");
+    Expect(srtcp_keys->salt != srtp_keys->salt, "SRTCP 세션 솔트는 SRTP와 다름");
 }
 
 
@@ -235,16 +277,202 @@ void TestRejectsMalformedRtp() {
 }
 
 
+// 보고 블록 하나인 RR(32바이트) 뒤에 CNAME SDES(28바이트)가 이어진 RTCP 복합 패킷을 만든다.
+//
+// ssrc: RR과 SDES의 보낸 쪽 SSRC
+// 반환값: 60바이트 복합 패킷
+std::vector<std::uint8_t> BuildTestRtcpCompound(std::uint32_t ssrc = 1) {
+    const std::array<std::uint8_t, 4> ssrc_bytes = {static_cast<std::uint8_t>(ssrc >> 24),
+                                                    static_cast<std::uint8_t>(ssrc >> 16),
+                                                    static_cast<std::uint8_t>(ssrc >> 8), static_cast<std::uint8_t>(ssrc)};
+    std::vector<std::uint8_t> compound = {0x81, 0xC9, 0x00, 0x07};
+    compound.insert(compound.end(), ssrc_bytes.begin(), ssrc_bytes.end());
+    compound.insert(compound.end(), {0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x11, 0xEB,
+                                     0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+    compound.insert(compound.end(), {0x81, 0xCA, 0x00, 0x06});
+    compound.insert(compound.end(), ssrc_bytes.begin(), ssrc_bytes.end());
+    compound.insert(compound.end(), {0x01, 0x10});
+    for (char character = 'a'; character <= 'p'; ++character) {
+        compound.push_back(static_cast<std::uint8_t>(character));
+    }
+    compound.insert(compound.end(), {0x00, 0x00});
+    return compound;
+}
+
+
+// SRTCP 테스트 송신 측과 서버 수신 측을 같은 마스터 키로 만든다.
+struct SrtcpPair {
+    // 브라우저 역할 송신 측
+    SrtcpTestSender sender;
+
+
+    // 서버 수신 측
+    std::unique_ptr<SrtcpReceiver> receiver;
+};
+
+
+// 같은 마스터 키·솔트로 송신·수신 측을 만든다.
+//
+// 반환값: 송신·수신 측. 생성에 실패하면 빈 optional
+std::optional<SrtcpPair> CreateSrtcpPair() {
+    auto sender = SrtcpTestSender::Create(kMasterKey, kMasterSalt);
+    auto receiver = SrtcpReceiver::Create(kMasterKey, kMasterSalt);
+    if (!sender || !receiver) {
+        return std::nullopt;
+    }
+    return SrtcpPair{.sender = *std::move(sender), .receiver = *std::move(receiver)};
+}
+
+
+// 받아들이지 않은 결과의 원인이 기대한 값인지 확인한다.
+//
+// result: Unprotect 결과
+// failure: 기대한 원인
+// 반환값: 실패했고 원인이 같으면 true
+bool FailedWith(const std::expected<std::vector<std::uint8_t>, SrtcpUnprotectError>& result,
+                SrtcpUnprotectFailure failure) {
+    return !result && result.error().failure == failure;
+}
+
+
+// E=1로 보호한 패킷은 원본으로 복원되고, E=0 패킷은 인증만으로 받아들인다.
+void TestSrtcpRoundTrip() {
+    auto pair = CreateSrtcpPair();
+    if (!pair) {
+        Expect(false, "SRTCP 송신·수신 측 생성이 성공해야 한다");
+        return;
+    }
+    const std::vector<std::uint8_t> compound = BuildTestRtcpCompound();
+
+    const auto encrypted = pair->sender.Protect(compound, true);
+    if (!encrypted) {
+        Expect(false, "SRTCP 보호가 성공해야 한다");
+        return;
+    }
+    Expect(encrypted->size() == compound.size() + 14, "SRTCP 꼬리는 인덱스 4바이트와 태그 10바이트");
+    Expect(std::equal(compound.begin(), compound.begin() + 8, encrypted->begin()), "첫 8바이트는 평문");
+    Expect(!std::equal(compound.begin() + 8, compound.end(), encrypted->begin() + 8), "나머지는 암호화됨");
+    const auto recovered = pair->receiver->Unprotect(*encrypted);
+    Expect(recovered && *recovered == compound, "E=1 패킷은 보호 전 복합 패킷으로 복원");
+
+    const auto authenticated_only = pair->sender.Protect(compound, false);
+    Expect(authenticated_only && std::equal(compound.begin(), compound.end(), authenticated_only->begin()),
+           "E=0 패킷은 RTCP 부분이 평문");
+    const auto accepted = authenticated_only ? pair->receiver->Unprotect(*authenticated_only)
+                                             : std::unexpected(SrtcpUnprotectError{});
+    Expect(accepted && *accepted == compound, "E=0 패킷은 인증만으로 받아들임");
+}
+
+
+// 암호문이나 인덱스의 한 비트를 바꾸면 인증 실패, 21바이트 패킷은 길이 부족이다.
+void TestSrtcpRejectsTamperedAndShort() {
+    auto pair = CreateSrtcpPair();
+    if (!pair) {
+        Expect(false, "SRTCP 송신·수신 측 생성이 성공해야 한다");
+        return;
+    }
+    const auto protected_packet = pair->sender.Protect(BuildTestRtcpCompound(), true, 42);
+    if (!protected_packet) {
+        Expect(false, "SRTCP 보호가 성공해야 한다");
+        return;
+    }
+
+    auto tampered_ciphertext = *protected_packet;
+    tampered_ciphertext[20] ^= 0x01;
+    Expect(FailedWith(pair->receiver->Unprotect(tampered_ciphertext), SrtcpUnprotectFailure::kAuthenticationFailed),
+           "암호문 1비트 변조는 인증 실패");
+
+    // 인덱스 단어의 마지막 바이트는 태그 바로 앞이다.
+    auto tampered_index = *protected_packet;
+    tampered_index[tampered_index.size() - 11] ^= 0x01;
+    const auto index_result = pair->receiver->Unprotect(tampered_index);
+    Expect(FailedWith(index_result, SrtcpUnprotectFailure::kAuthenticationFailed), "인덱스 1비트 변조는 인증 실패");
+    Expect(!index_result && index_result.error().ssrc == 1u && index_result.error().srtcp_index == 43u,
+           "오류에 패킷의 SSRC와 인덱스가 담김");
+
+    const std::vector<std::uint8_t> short_packet(protected_packet->begin(), protected_packet->begin() + 21);
+    const auto short_result = pair->receiver->Unprotect(short_packet);
+    Expect(FailedWith(short_result, SrtcpUnprotectFailure::kTooShort), "21바이트 패킷은 길이 부족");
+    Expect(!short_result && short_result.error().ssrc == 1u && !short_result.error().srtcp_index,
+           "길이 부족 오류에는 SSRC만 담김");
+
+    Expect(pair->receiver->Unprotect(*protected_packet).has_value(), "변조 패킷 뒤에도 원본은 받아들임");
+}
+
+
+// 재생 방지 창: 같은 패킷, 순서 바뀐 패킷, 창보다 오래된 패킷, 인증 실패 패킷의 인덱스를 검사한다.
+void TestSrtcpReplayWindow() {
+    auto pair = CreateSrtcpPair();
+    if (!pair) {
+        Expect(false, "SRTCP 송신·수신 측 생성이 성공해야 한다");
+        return;
+    }
+    const std::vector<std::uint8_t> compound = BuildTestRtcpCompound();
+    const auto protect = [&](std::uint32_t index) { return *pair->sender.Protect(compound, true, index); };
+
+    const auto first = protect(0);
+    Expect(pair->receiver->Unprotect(first).has_value(), "처음 받은 패킷은 받아들임");
+    const auto replayed = pair->receiver->Unprotect(first);
+    Expect(FailedWith(replayed, SrtcpUnprotectFailure::kReplayed), "같은 패킷 두 번째는 재생");
+    Expect(!replayed && replayed.error().ssrc == 1u && replayed.error().srtcp_index == 0u,
+           "재생 오류에 SSRC와 인덱스가 담김");
+
+    Expect(pair->receiver->Unprotect(protect(10)).has_value(), "인덱스 10은 받아들임");
+    Expect(pair->receiver->Unprotect(protect(9)).has_value(), "인덱스 10 뒤 9도 받아들임");
+    Expect(pair->receiver->Unprotect(protect(100)).has_value(), "인덱스 100은 받아들임");
+    Expect(FailedWith(pair->receiver->Unprotect(protect(30)), SrtcpUnprotectFailure::kReplayed),
+           "인덱스 100 뒤 30은 창보다 오래되어 재생");
+    Expect(pair->receiver->Unprotect(protect(37)).has_value(), "인덱스 100 뒤 37은 창 안이라 받아들임");
+
+    auto forged = protect(5);
+    forged.back() ^= 0x01;
+    auto other_pair = CreateSrtcpPair();
+    if (!other_pair) {
+        Expect(false, "두 번째 SRTCP 송신·수신 측 생성이 성공해야 한다");
+        return;
+    }
+    Expect(FailedWith(other_pair->receiver->Unprotect(forged), SrtcpUnprotectFailure::kAuthenticationFailed),
+           "태그가 틀린 인덱스 5는 인증 실패");
+    Expect(other_pair->receiver->Unprotect(protect(5)).has_value(), "인증 실패는 창에 남지 않아 올바른 인덱스 5는 받아들임");
+}
+
+
+// SSRC 8개까지는 창을 만들고, 9번째 새 SSRC는 거부한다.
+void TestSrtcpSsrcLimit() {
+    auto pair = CreateSrtcpPair();
+    if (!pair) {
+        Expect(false, "SRTCP 송신·수신 측 생성이 성공해야 한다");
+        return;
+    }
+    for (std::uint32_t ssrc = 1; ssrc <= 8; ++ssrc) {
+        const auto packet = pair->sender.Protect(BuildTestRtcpCompound(ssrc), true);
+        Expect(packet && pair->receiver->Unprotect(*packet).has_value(), "8번째 SSRC까지는 받아들임");
+    }
+    const auto ninth = pair->sender.Protect(BuildTestRtcpCompound(9), true);
+    const auto result = ninth ? pair->receiver->Unprotect(*ninth) : std::unexpected(SrtcpUnprotectError{});
+    Expect(FailedWith(result, SrtcpUnprotectFailure::kTooManySsrcs), "9번째 SSRC는 SSRC 수 초과");
+    Expect(!result && result.error().ssrc == 9u, "SSRC 수 초과 오류에 SSRC가 담김");
+
+    const auto known = pair->sender.Protect(BuildTestRtcpCompound(3), true);
+    Expect(known && pair->receiver->Unprotect(*known).has_value(), "이미 창이 있는 SSRC는 계속 받아들임");
+}
+
+
 }  // namespace
 
 
 int main() {
     TestRfc3711KeyDerivation();
+    TestSrtcpKeyDerivation();
     TestRfc3711Keystream();
     TestProtectedPacketShape();
     TestReceiverRoundTrip();
     TestRolloverCounter();
     TestTamperedTagRejected();
     TestRejectsMalformedRtp();
+    TestSrtcpRoundTrip();
+    TestSrtcpRejectsTamperedAndShort();
+    TestSrtcpReplayWindow();
+    TestSrtcpSsrcLimit();
     return vms::test::ExitCode();
 }

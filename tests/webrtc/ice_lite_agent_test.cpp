@@ -22,6 +22,7 @@
 #include "dtls_test_client.h"
 #include "media/h264_file.h"
 #include "rtp_test_support.h"
+#include "srtcp_test_sender.h"
 #include "srtp_test_receiver.h"
 #include "test_support.h"
 #include "webrtc/dtls_transport.h"
@@ -39,6 +40,7 @@ using vms::test::MakeSyntheticH264File;
 using vms::test::ParseRtpPacket;
 using vms::test::ReassembleNalUnits;
 using vms::test::ReceivedRtpPacket;
+using vms::test::SrtcpTestSender;
 using vms::test::SrtpTestReceiver;
 using vms::test::TransmittedNalUnits;
 using vms::webrtc::DtlsTransport;
@@ -49,6 +51,7 @@ using vms::webrtc::IceSessionParameters;
 using vms::webrtc::IceSessionRequest;
 using vms::webrtc::IceSessionState;
 using vms::webrtc::ParseStunMessage;
+using vms::webrtc::RtcpReceiveStats;
 using vms::webrtc::StunTransactionId;
 using vms::webrtc::VerifyFingerprint;
 using vms::webrtc::VerifyMessageIntegrity;
@@ -805,6 +808,183 @@ void TestStopsWhenSessionExpires(EventLoop& loop, IceLiteAgent& agent, const H26
 }
 
 
+// 보고 블록 하나인 RR(보낸 쪽 SSRC 1) 뒤에 CNAME SDES가 이어진 RTCP 복합 패킷을 만든다.
+//
+// target_ssrc: 보고 블록의 대상 SSRC. 서버 세션의 SSRC를 넘긴다.
+// 반환값: RR 32바이트와 SDES 24바이트로 된 복합 패킷. 손실률 3, 누적 손실 7, 최고 순번 70123, jitter 12
+std::vector<std::uint8_t> BuildReceiverReportCompound(std::uint32_t target_ssrc) {
+    std::vector<std::uint8_t> compound = {0x81, 0xC9, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01};
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        compound.push_back(static_cast<std::uint8_t>(target_ssrc >> shift));
+    }
+    compound.insert(compound.end(), {0x03, 0x00, 0x00, 0x07, 0x00, 0x01, 0x11, 0xEB, 0x00, 0x00, 0x00, 0x0C,
+                                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+    compound.insert(compound.end(), {0x81, 0xCA, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x01, 0x0A, 'b', 'r',
+                                     'o', 'w', 's', 'e', 'r', '0', '0', '1', 0x00, 0x00, 0x00, 0x00});
+    return compound;
+}
+
+
+// 수신 측의 DTLS 키 재료로 SRTCP 테스트 송신 측을 만든다.
+//
+// receiver: 핸드셰이크를 마친 수신 측
+// use_client_key: true이면 브라우저 쪽(client) 키, false이면 서버 쪽(server) 키를 쓴다.
+// 반환값: 송신 측. 키를 꺼내지 못하거나 유도에 실패하면 빈 optional
+std::optional<SrtcpTestSender> CreateSrtcpSender(const MediaReceiver& receiver, bool use_client_key) {
+    // 키 재료는 클라이언트 키(16), 서버 키(16), 클라이언트 솔트(14), 서버 솔트(14) 순서다.
+    const auto keying_material = receiver.dtls_client.ExportSrtpKeyingMaterial();
+    if (!keying_material) {
+        return std::nullopt;
+    }
+    const std::span<const std::uint8_t, 60> material(*keying_material);
+    auto sender = use_client_key ? SrtcpTestSender::Create(material.subspan<0, 16>(), material.subspan<32, 14>())
+                                 : SrtcpTestSender::Create(material.subspan<16, 16>(), material.subspan<46, 14>());
+    if (!sender) {
+        return std::nullopt;
+    }
+    return *std::move(sender);
+}
+
+
+// 데이터그램을 서버로 보내고 에이전트가 처리할 시간 동안 루프를 돌린다. 응답은 기다리지 않는다.
+//
+// loop: 에이전트가 등록된 이벤트 루프
+// client: 보낼 클라이언트
+// server: 서버 candidate 주소
+// datagrams: 보낼 데이터그램
+void SendWithoutResponse(EventLoop& loop, const TestClient& client, const sockaddr_in& server,
+                         const std::vector<std::vector<std::uint8_t>>& datagrams) {
+    for (const auto& datagram : datagrams) {
+        ::sendto(client.socket.Get(), datagram.data(), datagram.size(), 0,
+                 reinterpret_cast<const sockaddr*>(&server), sizeof(server));
+    }
+    RunLoopFor(loop, 30ms);
+}
+
+
+// 두 수신 결과의 개수가 모두 같은지 확인한다.
+//
+// left, right: 비교할 수신 결과
+// 반환값: 복합 패킷 수, 종류별 수, 원인별 실패 수가 모두 같으면 true
+bool HaveSameCounts(const RtcpReceiveStats& left, const RtcpReceiveStats& right) {
+    return left.compound_packet_count == right.compound_packet_count &&
+           left.packet_count_by_type == right.packet_count_by_type && left.too_short_count == right.too_short_count &&
+           left.authentication_failure_count == right.authentication_failure_count &&
+           left.replayed_count == right.replayed_count && left.too_many_ssrcs_count == right.too_many_ssrcs_count &&
+           left.crypto_failure_count == right.crypto_failure_count && left.malformed_count == right.malformed_count;
+}
+
+
+// DTLS가 완료된 세션이 브라우저 키로 보호한 RTCP를 해석하고, 다른 키·재전송·다른 주소·RTP를 구분하는지
+// 검사한다.
+void TestReceivesRtcpAfterHandshake(EventLoop& loop, IceLiteAgent& agent) {
+    auto receiver = ConnectMediaReceiver(loop, agent, nullptr);
+    const TestClient other_client = OpenClient();
+    if (!receiver || !other_client.socket.IsValid()) {
+        Expect(false, "RTCP 수신 측 연결");
+        return;
+    }
+    auto browser_sender = CreateSrtcpSender(*receiver, true);
+    auto server_key_sender = CreateSrtcpSender(*receiver, false);
+    if (!browser_sender || !server_key_sender) {
+        Expect(false, "SRTCP 송신 측 준비");
+        return;
+    }
+    const std::string& local_ufrag = receiver->session.ice_ufrag;
+    const sockaddr_in server = ServerEndpoint(agent);
+    const std::vector<std::uint8_t> compound = BuildReceiverReportCompound(receiver->session.ssrc);
+
+    const auto first_packet = browser_sender->Protect(compound, true);
+    SendWithoutResponse(loop, receiver->client, server, {*first_packet});
+    auto stats = agent.FindRtcpReceiveStats(local_ufrag);
+    if (!stats) {
+        Expect(false, "세션의 RTCP 수신 결과 조회");
+        return;
+    }
+    Expect(stats->compound_packet_count == 1, "RR+SDES 하나는 복합 패킷 1개");
+    Expect(stats->packet_count_by_type[201] == 1 && stats->packet_count_by_type[202] == 1, "RR 1개, SDES 1개");
+    const auto& block = stats->last_receiver_report_block;
+    Expect(block && block->source_ssrc == receiver->session.ssrc && block->fraction_lost == 3 &&
+               block->cumulative_lost == 7 && block->extended_highest_sequence_number == 70123 && block->jitter == 12,
+           "마지막 보고 블록 값이 보낸 값과 같음");
+
+    // 서버 쪽 키로 보호한 패킷은 브라우저가 보낸 것이 아니므로 모두 인증에 실패한다. 재생 확인이 인증보다
+    // 먼저이므로, 아직 받지 않은 인덱스(100~104)를 써서 인증 단계까지 가게 한다.
+    std::vector<std::vector<std::uint8_t>> wrong_key_packets;
+    for (std::uint32_t index = 100; index < 105; ++index) {
+        wrong_key_packets.push_back(*server_key_sender->Protect(compound, true, index));
+    }
+    SendWithoutResponse(loop, receiver->client, server, wrong_key_packets);
+    SendWithoutResponse(loop, receiver->client, server, {*browser_sender->Protect(compound, true)});
+    stats = agent.FindRtcpReceiveStats(local_ufrag);
+    Expect(stats->authentication_failure_count == 5, "다른 키로 보호한 패킷 5개는 인증 실패 5");
+    Expect(stats->detailed_failure_log_count == 3, "상세 로그는 처음 3개만");
+    Expect(stats->compound_packet_count == 2 && stats->packet_count_by_type[201] == 2,
+           "인증 실패 뒤 올바른 패킷은 정상 집계");
+
+    SendWithoutResponse(loop, receiver->client, server, {*first_packet});
+    stats = agent.FindRtcpReceiveStats(local_ufrag);
+    Expect(stats->replayed_count == 1 && stats->compound_packet_count == 2, "같은 패킷 재전송은 재생 1");
+
+    const RtcpReceiveStats before = *stats;
+    SendWithoutResponse(loop, other_client, server, {*browser_sender->Protect(compound, true)});
+    Expect(HaveSameCounts(before, *agent.FindRtcpReceiveStats(local_ufrag)),
+           "nominated pair가 아닌 주소의 RTCP는 통계를 바꾸지 않음");
+
+    // 둘째 바이트 102는 RTP payload type이다. 브라우저 키로 보호하더라도 RTCP로 처리하지 않는다.
+    std::vector<std::uint8_t> rtp_packet = *browser_sender->Protect(compound, true);
+    rtp_packet[0] = 0x80;
+    rtp_packet[1] = 102;
+    SendWithoutResponse(loop, receiver->client, server, {rtp_packet});
+    Expect(HaveSameCounts(before, *agent.FindRtcpReceiveStats(local_ufrag)), "둘째 바이트가 102인 RTP 패킷은 버림");
+    Expect(agent.FindSessionState(local_ufrag) == IceSessionState::kConnected, "버린 패킷 뒤에도 세션은 연결됨");
+}
+
+
+// nomination은 받았지만 DTLS가 완료되지 않은 세션은 RTCP를 처리하지 않는지 검사한다.
+void TestDropsRtcpBeforeDtls(EventLoop& loop, IceLiteAgent& agent) {
+    const auto credentials = CreateTestSession(agent, kTestRemoteFingerprint);
+    const TestClient client = OpenClient();
+    auto sender = SrtcpTestSender::Create(std::array<std::uint8_t, 16>{}, std::array<std::uint8_t, 14>{});
+    if (!credentials || !client.socket.IsValid() || !sender) {
+        Expect(false, "세션과 클라이언트 준비");
+        return;
+    }
+    const sockaddr_in server = ServerEndpoint(agent);
+    Expect(Nominate(loop, client, server, credentials->ice_ufrag, credentials->ice_pwd), "USE-CANDIDATE에 응답");
+
+    SendWithoutResponse(loop, client, server, {*sender->Protect(BuildReceiverReportCompound(credentials->ssrc), true)});
+    const auto stats = agent.FindRtcpReceiveStats(credentials->ice_ufrag);
+    Expect(stats && HaveSameCounts(*stats, RtcpReceiveStats{}), "DTLS 완료 전의 RTCP는 통계를 바꾸지 않음");
+}
+
+
+// 동영상을 보내는 세션에서 RTCP 실패 패킷을 받은 뒤에도 RTP 송신이 계속되는지 검사한다.
+void TestVideoContinuesAfterRtcpFailures(EventLoop& loop, IceLiteAgent& agent, const H264File& video) {
+    auto receiver = ConnectMediaReceiver(loop, agent, &video);
+    if (!receiver) {
+        Expect(false, "동영상 수신 측 연결");
+        return;
+    }
+    auto server_key_sender = CreateSrtcpSender(*receiver, false);
+    if (!server_key_sender) {
+        Expect(false, "SRTCP 송신 측 준비");
+        return;
+    }
+    const sockaddr_in server = ServerEndpoint(agent);
+    const std::vector<std::uint8_t> compound = BuildReceiverReportCompound(receiver->session.ssrc);
+    SendWithoutResponse(loop, receiver->client, server,
+                        {*server_key_sender->Protect(compound, true), {0x81, 0xC9, 0x00, 0x01}});
+    const auto stats = agent.FindRtcpReceiveStats(receiver->session.ice_ufrag);
+    Expect(stats && stats->authentication_failure_count == 1 && stats->too_short_count == 1,
+           "인증 실패와 길이 부족을 각각 셈");
+
+    DrainSocket(receiver->client);
+    RunLoopFor(loop, 100ms);
+    Expect(!FilterRtpPackets(DrainSocket(receiver->client)).empty(), "실패 패킷 뒤에도 RTP를 계속 받음");
+}
+
+
 }  // namespace
 
 
@@ -836,6 +1016,8 @@ int main() {
     TestCompletesDtlsHandshakeOverUdp(*loop, **agent, *certificate);
     TestKeepsFirstNominatedPairForDtls(*loop, **agent);
     TestNoMediaWithoutVideo(*loop, **agent);
+    TestReceivesRtcpAfterHandshake(*loop, **agent);
+    TestDropsRtcpBeforeDtls(*loop, **agent);
 
     // 동영상 송신 시나리오는 합성 동영상을 세션에 지정하고 높은 fps로 보내는 에이전트로 검사한다.
     const H264File video = MakeSyntheticH264File();
@@ -849,6 +1031,7 @@ int main() {
     TestStreamsVideoAfterHandshake(*loop, **video_agent, video);
     TestStopsOnlyClosedSession(*loop, **video_agent, video);
     TestStreamsVideoPerSession(*loop, **video_agent, video, other_video);
+    TestVideoContinuesAfterRtcpFailures(*loop, **video_agent, video);
 
     // 세션 만료 시나리오는 만료 시간을 짧게 둔 별도 에이전트로 검사한다.
     auto short_timeout_agent = IceLiteAgent::Start(

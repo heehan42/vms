@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -18,9 +19,11 @@
 #include "core/event_loop.h"
 #include "core/unique_fd.h"
 #include "crypto/dtls_context.h"
+#include "crypto/srtp.h"
 #include "media/h264_file.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_candidate.h"
+#include "webrtc/rtcp_packet.h"
 #include "webrtc/video_stream_sender.h"
 
 
@@ -99,8 +102,53 @@ enum class IceSessionState {
 };
 
 
+// 세션 하나가 브라우저에게서 받은 RTCP의 수신 결과와 버린 패킷 수.
+//
+// 세션과 함께 만들어지고 사라지며, 세션을 제거할 때 요약 로그로 남긴다.
+struct RtcpReceiveStats {
+    // 검증·복호화·해석을 모두 통과한 RTCP 복합 패킷 수
+    std::uint64_t compound_packet_count = 0;
+
+
+    // 통과한 복합 패킷 안의 RTCP 패킷 수. 키는 패킷 종류 번호(PT)다.
+    std::map<std::uint8_t, std::uint64_t> packet_count_by_type;
+
+
+    // 마지막으로 받은 RR의 마지막 보고 블록. 아직 보고 블록이 담긴 RR을 받지 않았으면 비어 있다.
+    std::optional<RtcpReportBlock> last_receiver_report_block;
+
+
+    // 길이 부족으로 버린 패킷 수
+    std::uint64_t too_short_count = 0;
+
+
+    // SRTCP 인증 실패로 버린 패킷 수
+    std::uint64_t authentication_failure_count = 0;
+
+
+    // 재생 방지 창에서 거부해 버린 패킷 수
+    std::uint64_t replayed_count = 0;
+
+
+    // 재생 방지 창을 둘 SSRC 수를 넘어 버린 패킷 수
+    std::uint64_t too_many_ssrcs_count = 0;
+
+
+    // OpenSSL 연산 실패로 버린 패킷 수
+    std::uint64_t crypto_failure_count = 0;
+
+
+    // 복호화 뒤 RTCP 형식 오류로 버린 패킷 수
+    std::uint64_t malformed_count = 0;
+
+
+    // 원인과 패킷 정보를 상세 로그로 남긴 실패 수. 세션마다 처음 몇 개만 남긴다.
+    std::uint64_t detailed_failure_log_count = 0;
+};
+
+
 // UDP 포트에서 STUN Binding 요청을 검증하고 응답하며, nominated pair 위의 DTLS 패킷을 세션의
-// DTLS 처리로 넘기는 ICE-lite 에이전트.
+// DTLS 처리로, DTLS가 완료된 세션의 RTCP 패킷을 세션의 RTCP 처리로 넘기는 ICE-lite 에이전트.
 //
 // 서버는 ICE-lite이므로 항상 controlled 역할이다. 브라우저가 보낸 연결 확인 요청에 응답하고
 // 브라우저의 nomination을 받아들이기만 하며, 먼저 요청을 보내지 않는다.
@@ -159,6 +207,13 @@ public:
     // local_ufrag: CreateSession이 돌려준 서버 ufrag
     // 반환값: 세션 상태. 세션이 없으면 빈 optional
     std::optional<IceSessionState> FindSessionState(std::string_view local_ufrag) const;
+
+
+    // 세션의 RTCP 수신 결과를 조회한다.
+    //
+    // local_ufrag: CreateSession이 돌려준 서버 ufrag
+    // 반환값: 조회 시점의 수신 결과 복사본. 세션이 없으면 빈 optional
+    std::optional<RtcpReceiveStats> FindRtcpReceiveStats(std::string_view local_ufrag) const;
 
 
 private:
@@ -284,6 +339,18 @@ private:
 
         // 동영상 패킷의 송신 실패를 이미 로그에 남겼는지 여부. 세션마다 첫 실패만 남긴다.
         bool has_logged_send_failure = false;
+
+
+        // 브라우저가 보내는 SRTCP를 검증·복호화하는 수신 상태. DTLS가 kConnected가 될 때 브라우저 쪽
+        // (remote) 키로 만들고, kFailed·kClosed가 되면 지운다.
+        //
+        // 동영상 지정 여부와 관계없이 만들며, 값이 있는 세션만 RTCP를 처리한다. 생성에 실패하면 비어 있어
+        // 그 세션의 RTCP는 nominated pair가 아닌 주소의 패킷처럼 버려진다.
+        std::unique_ptr<crypto::SrtcpReceiver> srtcp_receiver;
+
+
+        // 이 세션이 받은 RTCP의 수신 결과와 버린 패킷 수
+        RtcpReceiveStats rtcp_stats;
     };
 
 
@@ -352,6 +419,39 @@ private:
                           const sockaddr_in& remote_endpoint);
 
 
+    // RTCP 패킷을 nominated pair 테이블로 세션을 찾아 SRTCP 검증·복호화와 RTCP 해석을 하고 기록한다.
+    //
+    // socket_index: 패킷이 도착한 소켓의 위치
+    // packet: 첫 바이트가 RTP/RTCP 범위이고 둘째 바이트가 RTCP 범위인 데이터그램
+    // remote_endpoint: 보낸 쪽 주소
+    //
+    // nominated pair가 아니거나 SRTCP 수신 상태가 없는(DTLS 미완료·실패·닫힘) 세션의 패킷은 버리고
+    // 주소별 첫 패킷만 로그를 남긴다. 검증이나 해석에 실패하면 원인별 개수를 세고 처음 몇 개만 상세
+    // 로그를 남긴다. 성공하면 수신 결과를 갱신하고 세션의 첫 복합 패킷만 상세 로그를 남긴다.
+    // RTCP 수신은 세션 만료 판정에 영향을 주지 않는다.
+    void HandleRtcpPacket(std::size_t socket_index, std::span<const std::uint8_t> packet,
+                          const sockaddr_in& remote_endpoint);
+
+
+    // 세션이 RTCP 패킷 하나를 버린 원인을 세고, 세션의 처음 몇 개 실패만 상세 로그로 남긴다.
+    //
+    // session: 패킷을 받은 세션
+    // reason: 로그에 남길 원인 문구
+    // ssrc: 패킷의 보낸 쪽 SSRC. 읽을 수 없었으면 빈 optional
+    // srtcp_index: 패킷의 SRTCP 인덱스. 읽을 수 없었으면 빈 optional
+    // packet_size: 받은 데이터그램 길이(바이트)
+    //
+    // 호출 전에 원인별 개수는 호출자가 올려 둔다.
+    void LogRtcpFailure(SessionIterator session, std::string_view reason, std::optional<std::uint32_t> ssrc,
+                        std::optional<std::uint32_t> srtcp_index, std::size_t packet_size);
+
+
+    // 세션의 RTCP 수신 요약을 로그에 남긴다. 받은 복합 패킷도 실패도 없으면 남기지 않는다.
+    //
+    // session: 요약할 세션
+    void LogRtcpSummary(SessionIterator session);
+
+
     // 세션의 DTLS 재전송 타이머가 만료되었을 때 재전송한다.
     //
     // local_ufrag: 타이머를 건 세션의 서버 ufrag. 그 사이 세션이 제거되었으면 아무것도 하지 않는다.
@@ -365,7 +465,8 @@ private:
     // datagrams: DtlsTransport가 돌려준 데이터그램
     // previous_state: 호출 전 DTLS 상태
     //
-    // kConnected가 되면 동영상 송신을 시작하고, kClosed나 kFailed가 되면 송신을 멈춘다.
+    // kConnected가 되면 SRTCP 수신 상태를 만들고 동영상 송신을 시작한다. kClosed나 kFailed가 되면
+    // 송신을 멈추고 SRTCP 수신 상태를 지운다.
     void FinishDtlsStep(SessionIterator session, const std::vector<Datagram>& datagrams,
                         DtlsState previous_state);
 
@@ -420,7 +521,7 @@ private:
     //
     // session: 제거할 세션. 호출 뒤에는 무효다.
     //
-    // 송신 중지, 타이머 취소, nominated pair 테이블 항목 삭제, 세션 삭제 순서로 한다. 세션을 지우면
+    // 송신 중지, 타이머 취소, nominated pair 테이블 항목 삭제, RTCP 수신 요약 로그, 세션 삭제 순서로 한다. 세션을 지우면
     // DtlsTransport의 SSL이 함께 해제된다.
     void RemoveSession(SessionIterator session);
 

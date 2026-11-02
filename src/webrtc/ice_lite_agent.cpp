@@ -9,6 +9,7 @@
 #include <format>
 #include <functional>
 #include <print>
+#include <string>
 #include <utility>
 
 #include "core/network_interfaces.h"
@@ -56,7 +57,19 @@ constexpr std::uint32_t kHostTypePreference = 126;
 constexpr std::uint32_t kRtpComponentId = 1;
 
 
-// 첫 바이트로 구분한 UDP 패킷의 프로토콜(RFC 7983)
+// RTCP 상세 실패 로그를 남기는 세션당 최대 실패 수. 그 뒤 실패는 개수만 센다.
+constexpr std::uint64_t kMaxDetailedRtcpFailureLogs = 3;
+
+
+// 로그에 남기는 CNAME의 최대 길이(바이트)
+constexpr std::size_t kMaxLoggedCnameSize = 64;
+
+
+// SRTCP 패킷 끝에서 인덱스 단어가 시작하는 위치(끝에서부터의 바이트 수). 인덱스 4바이트와 태그 10바이트다.
+constexpr std::size_t kSrtcpTrailerSize = 4 + crypto::kSrtpAuthenticationTagSize;
+
+
+// 첫 바이트(RTP·RTCP는 둘째 바이트까지)로 구분한 UDP 패킷의 프로토콜(RFC 7983, RFC 5761 4절)
 enum class PacketKind {
     // ICE 연결 확인 메시지. 첫 바이트 0~3
     kStun,
@@ -64,19 +77,24 @@ enum class PacketKind {
     // DTLS 레코드. 첫 바이트 20~63
     kDtls,
 
-    // RTP 또는 RTCP. 첫 바이트 128~191
+    // RTP. 첫 바이트 128~191이고 둘째 바이트가 RTCP 범위가 아님
     kRtp,
+
+    // RTCP. 첫 바이트 128~191이고 둘째 바이트(PT) 192~223
+    kRtcp,
 
     // 위 범위에 속하지 않는 패킷. 버린다.
     kUnknown,
 };
 
 
-// 데이터그램의 첫 바이트로 프로토콜을 구분한다.
+// 데이터그램의 앞 바이트로 프로토콜을 구분한다.
 //
-// first_byte: 데이터그램의 첫 바이트
-// 반환값: 0~3은 STUN, 20~63은 DTLS, 128~191은 RTP/RTCP, 그 밖은 알 수 없음
-PacketKind ClassifyPacket(std::uint8_t first_byte) {
+// packet: 비어 있지 않은 데이터그램
+// 반환값: 첫 바이트 0~3은 STUN, 20~63은 DTLS, 128~191은 둘째 바이트가 192~223이면 RTCP이고 아니면 RTP,
+//   그 밖은 알 수 없음
+PacketKind ClassifyPacket(std::span<const std::uint8_t> packet) {
+    const std::uint8_t first_byte = packet[0];
     if (first_byte <= 3) {
         return PacketKind::kStun;
     }
@@ -84,7 +102,9 @@ PacketKind ClassifyPacket(std::uint8_t first_byte) {
         return PacketKind::kDtls;
     }
     if (first_byte >= 128 && first_byte <= 191) {
-        return PacketKind::kRtp;
+        // RTP는 payload type 64~95를 쓰지 않으므로, marker 비트를 더한 둘째 바이트가 192~223이면 RTCP다.
+        const bool is_rtcp = packet.size() >= 2 && packet[1] >= 192 && packet[1] <= 223;
+        return is_rtcp ? PacketKind::kRtcp : PacketKind::kRtp;
     }
     return PacketKind::kUnknown;
 }
@@ -101,11 +121,85 @@ std::string_view PacketKindName(PacketKind kind) {
         case PacketKind::kDtls:
             return "DTLS";
         case PacketKind::kRtp:
-            return "RTP/RTCP";
+            return "RTP";
+        case PacketKind::kRtcp:
+            return "RTCP";
         case PacketKind::kUnknown:
             return "알 수 없는 프로토콜";
     }
     return "알 수 없는 프로토콜";
+}
+
+
+// RTCP 패킷 종류 번호를 로그용 이름으로 바꾼다.
+//
+// packet_type: RTCP 패킷 종류 번호(PT)
+// 반환값: SR·RR 같은 이름. 알려지지 않은 번호는 "PT <번호>"
+std::string RtcpPacketTypeName(std::uint8_t packet_type) {
+    switch (packet_type) {
+        case 200:
+            return "SR";
+        case 201:
+            return "RR";
+        case 202:
+            return "SDES";
+        case 203:
+            return "BYE";
+        case 204:
+            return "APP";
+        case 205:
+            return "RTPFB";
+        case 206:
+            return "PSFB";
+        default:
+            return std::format("PT {}", packet_type);
+    }
+}
+
+
+// 상대가 정한 문자열을 로그 한 줄에 안전하게 쓸 수 있게 바꾼다.
+//
+// text: 원본 바이트
+// 반환값: 출력할 수 있는 ASCII(0x20~0x7E)가 아닌 바이트를 '?'로 바꾸고 kMaxLoggedCnameSize바이트로 자른 문자열
+std::string SanitizeForLog(std::string_view text) {
+    std::string sanitized(text.substr(0, kMaxLoggedCnameSize));
+    for (char& character : sanitized) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte < 0x20 || byte > 0x7E) {
+            character = '?';
+        }
+    }
+    return sanitized;
+}
+
+
+// 해석한 RTCP 복합 패킷의 구성을 로그용 문구로 바꾼다.
+//
+// packets: ParseRtcpCompoundPacket의 결과
+// 반환값: "RR(보낸 쪽 SSRC 1, 대상 SSRC ..., ...), SDES(CNAME ...)" 형식 문자열
+std::string DescribeRtcpCompound(const std::vector<RtcpPacket>& packets) {
+    std::string description;
+    for (const RtcpPacket& packet : packets) {
+        if (!description.empty()) {
+            description += ", ";
+        }
+        description += RtcpPacketTypeName(packet.packet_type);
+        description += '(';
+        if (packet.packet_type == kRtcpSenderReportType || packet.packet_type == kRtcpReceiverReportType) {
+            description += std::format("보낸 쪽 SSRC {}", packet.sender_ssrc.value_or(0));
+            for (const RtcpReportBlock& block : packet.report_blocks) {
+                description += std::format(", 대상 SSRC {}, 손실률 {}/256, 누적 손실 {}, 최고 순번 {}, jitter {}",
+                                           block.source_ssrc, block.fraction_lost, block.cumulative_lost,
+                                           block.extended_highest_sequence_number, block.jitter);
+            }
+        } else if (packet.packet_type == kRtcpSourceDescriptionType) {
+            description += packet.cname ? std::format("CNAME {}", SanitizeForLog(*packet.cname)) : "CNAME 없음";
+        } else {
+            description += std::format("길이 {}바이트", packet.size);
+        }
+        description += ')';
+    }
+    return description;
 }
 
 
@@ -294,6 +388,15 @@ std::optional<IceSessionState> IceLiteAgent::FindSessionState(std::string_view l
 }
 
 
+std::optional<RtcpReceiveStats> IceLiteAgent::FindRtcpReceiveStats(std::string_view local_ufrag) const {
+    const auto found = sessions_.find(std::string(local_ufrag));
+    if (found == sessions_.end()) {
+        return std::nullopt;
+    }
+    return found->second.rtcp_stats;
+}
+
+
 void IceLiteAgent::ReceivePackets(std::size_t socket_index) {
     std::array<std::uint8_t, kReceiveBufferSize> buffer;
     for (int received_count = 0; received_count < kMaxPacketsPerEvent; ++received_count) {
@@ -327,7 +430,7 @@ void IceLiteAgent::ReceivePackets(std::size_t socket_index) {
 
 void IceLiteAgent::HandlePacket(std::size_t socket_index, std::span<const std::uint8_t> packet,
                                 const sockaddr_in& remote_endpoint) {
-    const PacketKind kind = ClassifyPacket(packet[0]);
+    const PacketKind kind = ClassifyPacket(packet);
     if (kind == PacketKind::kStun) {
         HandleStunPacket(socket_index, packet, remote_endpoint);
         return;
@@ -336,8 +439,12 @@ void IceLiteAgent::HandlePacket(std::size_t socket_index, std::span<const std::u
         HandleDtlsPacket(socket_index, packet, remote_endpoint);
         return;
     }
+    if (kind == PacketKind::kRtcp) {
+        HandleRtcpPacket(socket_index, packet, remote_endpoint);
+        return;
+    }
 
-    // RTP와 알 수 없는 패킷은 아직 처리하지 않는다.
+    // 서버는 sendonly라 브라우저가 RTP를 보낼 이유가 없으므로, RTP와 알 수 없는 패킷은 버린다.
     LogDroppedPacket(PacketKindName(kind), socket_index, remote_endpoint);
 }
 
@@ -483,6 +590,127 @@ void IceLiteAgent::HandleDtlsPacket(std::size_t socket_index, std::span<const st
 }
 
 
+void IceLiteAgent::HandleRtcpPacket(std::size_t socket_index, std::span<const std::uint8_t> packet,
+                                    const sockaddr_in& remote_endpoint) {
+    const NominatedPairKey key{.socket_index = socket_index,
+                               .remote_address = remote_endpoint.sin_addr.s_addr,
+                               .remote_port = remote_endpoint.sin_port};
+    const auto pair = nominated_pairs_.find(key);
+    const auto session = pair != nominated_pairs_.end() ? sessions_.find(pair->second) : sessions_.end();
+    if (session == sessions_.end() || !session->second.srtcp_receiver) {
+        LogDroppedPacket("RTCP", socket_index, remote_endpoint);
+        return;
+    }
+    Session& state = session->second;
+    RtcpReceiveStats& stats = state.rtcp_stats;
+
+    const auto compound = state.srtcp_receiver->Unprotect(packet);
+    if (!compound) {
+        const crypto::SrtcpUnprotectError& error = compound.error();
+        switch (error.failure) {
+            case crypto::SrtcpUnprotectFailure::kTooShort:
+                ++stats.too_short_count;
+                break;
+            case crypto::SrtcpUnprotectFailure::kAuthenticationFailed:
+                ++stats.authentication_failure_count;
+                break;
+            case crypto::SrtcpUnprotectFailure::kReplayed:
+                ++stats.replayed_count;
+                break;
+            case crypto::SrtcpUnprotectFailure::kTooManySsrcs:
+                ++stats.too_many_ssrcs_count;
+                break;
+            case crypto::SrtcpUnprotectFailure::kCryptoFailure:
+                ++stats.crypto_failure_count;
+                break;
+        }
+        const std::string_view failure_name = crypto::SrtcpUnprotectFailureName(error.failure);
+        LogRtcpFailure(session,
+                       error.detail.empty() ? std::string(failure_name) : std::format("{}({})", failure_name, error.detail),
+                       error.ssrc, error.srtcp_index, packet.size());
+        return;
+    }
+
+    const auto packets = ParseRtcpCompoundPacket(*compound);
+    if (!packets) {
+        // 검증을 통과했으므로 패킷은 헤더 8바이트와 꼬리 14바이트를 모두 가진다.
+        ++stats.malformed_count;
+        const std::uint32_t ssrc = (static_cast<std::uint32_t>(packet[4]) << 24) |
+                                   (static_cast<std::uint32_t>(packet[5]) << 16) |
+                                   (static_cast<std::uint32_t>(packet[6]) << 8) | packet[7];
+        const std::span<const std::uint8_t> index_word = packet.last(kSrtcpTrailerSize);
+        const std::uint32_t srtcp_index = ((static_cast<std::uint32_t>(index_word[0]) & 0x7F) << 24) |
+                                          (static_cast<std::uint32_t>(index_word[1]) << 16) |
+                                          (static_cast<std::uint32_t>(index_word[2]) << 8) | index_word[3];
+        LogRtcpFailure(session, std::format("형식 오류({})", packets.error()), ssrc, srtcp_index, packet.size());
+        return;
+    }
+
+    ++stats.compound_packet_count;
+    for (const RtcpPacket& rtcp_packet : *packets) {
+        ++stats.packet_count_by_type[rtcp_packet.packet_type];
+        if (rtcp_packet.packet_type == kRtcpReceiverReportType && !rtcp_packet.report_blocks.empty()) {
+            stats.last_receiver_report_block = rtcp_packet.report_blocks.back();
+        }
+    }
+
+    // 브라우저는 약 1초마다 RTCP를 보내므로, 수신 경로가 열렸다는 것을 보이는 첫 복합 패킷만 자세히 남긴다.
+    if (stats.compound_packet_count == 1) {
+        std::println(stderr, "RTCP 수신 시작: 세션 {}, 브라우저 {}: {}", session->first,
+                     core::FormatIpv4Endpoint(remote_endpoint), DescribeRtcpCompound(*packets));
+    }
+}
+
+
+void IceLiteAgent::LogRtcpFailure(SessionIterator session, std::string_view reason,
+                                  std::optional<std::uint32_t> ssrc, std::optional<std::uint32_t> srtcp_index,
+                                  std::size_t packet_size) {
+    RtcpReceiveStats& stats = session->second.rtcp_stats;
+    if (stats.detailed_failure_log_count >= kMaxDetailedRtcpFailureLogs) {
+        return;
+    }
+    ++stats.detailed_failure_log_count;
+
+    const auto optional_text = [](std::optional<std::uint32_t> value) {
+        return value ? std::to_string(*value) : std::string("알 수 없음");
+    };
+    std::println(stderr, "RTCP 버림: 세션 {}, 원인 {}, SSRC {}, 인덱스 {}, 길이 {}바이트 (상세 로그 {}/{})",
+                 session->first, reason, optional_text(ssrc), optional_text(srtcp_index), packet_size,
+                 stats.detailed_failure_log_count, kMaxDetailedRtcpFailureLogs);
+}
+
+
+void IceLiteAgent::LogRtcpSummary(SessionIterator session) {
+    const RtcpReceiveStats& stats = session->second.rtcp_stats;
+    const std::uint64_t failure_count = stats.too_short_count + stats.authentication_failure_count +
+                                        stats.replayed_count + stats.too_many_ssrcs_count +
+                                        stats.crypto_failure_count + stats.malformed_count;
+    if (stats.compound_packet_count == 0 && failure_count == 0) {
+        return;
+    }
+
+    std::string summary = std::format("복합 패킷 {}개", stats.compound_packet_count);
+    for (const auto& [packet_type, count] : stats.packet_count_by_type) {
+        summary += std::format(", {} {}개", RtcpPacketTypeName(packet_type), count);
+    }
+    if (const auto& block = stats.last_receiver_report_block) {
+        summary += std::format(", 마지막 RR(대상 SSRC {}, 손실률 {}/256, 누적 손실 {}, jitter {})", block->source_ssrc,
+                               block->fraction_lost, block->cumulative_lost, block->jitter);
+    }
+    summary += std::format(", 버림: 인증 실패 {}, 재생 {}, 길이 부족 {}, 형식 오류 {}",
+                           stats.authentication_failure_count, stats.replayed_count, stats.too_short_count,
+                           stats.malformed_count);
+    // 드문 원인은 생겼을 때만 덧붙인다.
+    if (stats.too_many_ssrcs_count > 0) {
+        summary += std::format(", SSRC 수 초과 {}", stats.too_many_ssrcs_count);
+    }
+    if (stats.crypto_failure_count > 0) {
+        summary += std::format(", 암호 연산 실패 {}", stats.crypto_failure_count);
+    }
+    std::println(stderr, "RTCP 수신 요약: 세션 {}, {}", session->first, summary);
+}
+
+
 void IceLiteAgent::HandleRetransmissionTimeout(const std::string& local_ufrag) {
     const auto session = sessions_.find(local_ufrag);
     if (session == sessions_.end()) {
@@ -530,19 +758,33 @@ void IceLiteAgent::FinishDtlsStep(SessionIterator session, const std::vector<Dat
         return;
     }
     switch (current_state) {
-        case DtlsState::kConnected:
+        case DtlsState::kConnected: {
             std::println(stderr, "DTLS 연결됨: 세션 {}, 브라우저 {}, SRTP 프로파일 {}", local_ufrag,
                          remote_text, transport.SelectedSrtpProfileName());
+
+            // 브라우저가 보내는 패킷은 브라우저 쪽(remote) 키로 보호되어 온다. 같은 이벤트 처리 안에서 만들므로
+            // 연결 직후 도착한 RTCP도 이 상태로 처리된다.
+            const SrtpKeyMaterial& keys = *transport.SrtpKeys();
+            auto srtcp_receiver = crypto::SrtcpReceiver::Create(keys.remote_key, keys.remote_salt);
+            if (srtcp_receiver) {
+                state.srtcp_receiver = *std::move(srtcp_receiver);
+            } else {
+                std::println(stderr, "SRTCP 수신 상태 생성 실패: 세션 {}, 브라우저 {}: {}. 이 세션의 RTCP는 버림",
+                             local_ufrag, remote_text, srtcp_receiver.error());
+            }
             StartVideoStream(session);
             break;
+        }
         case DtlsState::kFailed:
             std::println(stderr, "DTLS 실패: 세션 {}, 브라우저 {}: {}", local_ufrag, remote_text,
                          transport.FailureReason());
             StopVideoStream(session, "DTLS 실패");
+            state.srtcp_receiver.reset();
             break;
         case DtlsState::kClosed:
             std::println(stderr, "DTLS 닫힘: 세션 {}, 브라우저 {}", local_ufrag, remote_text);
             StopVideoStream(session, "DTLS 닫힘(close_notify)");
+            state.srtcp_receiver.reset();
             break;
         case DtlsState::kHandshaking:
             break;
@@ -674,6 +916,7 @@ void IceLiteAgent::RemoveSession(SessionIterator session) {
         }
     }
 
+    LogRtcpSummary(session);
     std::println(stderr, "ICE 세션 제거: 세션 {}, 브라우저 {}, {}ms 동안 유효한 요청 없음", local_ufrag,
                  remote_text, session_timeout_.count());
     sessions_.erase(session);

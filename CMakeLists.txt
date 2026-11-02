@@ -36,6 +36,7 @@ add_library(server_core STATIC
     src/webrtc/dtls_transport.cpp
     src/webrtc/h264_packetizer.cpp
     src/webrtc/ice_lite_agent.cpp
+    src/webrtc/rtcp_packet.cpp
     src/webrtc/rtp_packet.cpp
     src/webrtc/sdp.cpp
     src/webrtc/signaling.cpp
