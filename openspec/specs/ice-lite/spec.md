@@ -33,7 +33,7 @@
 - **THEN** 응답의 `MESSAGE-INTEGRITY`는 서버 `ice-pwd`로, `FINGERPRINT`는 CRC32 규칙으로 검증에 통과하고, `XOR-MAPPED-ADDRESS`는 클라이언트의 주소와 포트와 같다
 
 ### Requirement: 잘못된 요청 무시
-서버는 검증에 실패한 패킷에 응답하지 않고 원인을 로그에 남겨야 한다(SHALL). STUN 형식이 아니거나, `FINGERPRINT`가 없거나 틀리거나, `USERNAME`이 어떤 세션과도 맞지 않거나, `MESSAGE-INTEGRITY`가 없거나 틀린 요청이 이에 해당한다. 첫 바이트로 STUN이 아니라고 판정한 패킷 중 연결된 세션의 nominated pair의 주소에서 온 DTLS 패킷은 DTLS 처리로 넘긴다. 그 밖의 패킷(nominated pair가 아닌 주소의 DTLS, RTP 등)은 버리며, 브라우저가 재전송하므로 원격 주소마다 처음 한 번만 로그를 남긴다. 서버는 이런 패킷 때문에 종료되거나 다른 세션의 처리를 멈추지 않는다.
+서버는 검증에 실패한 패킷에 응답하지 않고 원인을 로그에 남겨야 한다(SHALL). STUN 형식이 아니거나, `FINGERPRINT`가 없거나 틀리거나, `USERNAME`이 어떤 세션과도 맞지 않거나, `MESSAGE-INTEGRITY`가 없거나 틀린 요청이 이에 해당한다. 첫 바이트로 STUN이 아니라고 판정한 패킷 중 연결된 세션의 nominated pair의 주소에서 온 DTLS 패킷은 DTLS 처리로 넘긴다. 첫 바이트가 128~191이고 둘째 바이트가 192~223인 패킷은 RTCP로 보고, DTLS가 완료된 세션의 nominated pair의 주소에서 왔으면 그 세션의 RTCP 처리로 넘긴다. 그 밖의 패킷(nominated pair가 아닌 주소의 DTLS, RTP, DTLS가 완료되지 않은 세션이나 nominated pair가 아닌 주소의 RTCP 등)은 버리며, 브라우저가 재전송하므로 원격 주소마다 처음 한 번만 로그를 남긴다. 서버는 이런 패킷 때문에 종료되거나 다른 세션의 처리를 멈추지 않는다.
 
 #### Scenario: 틀린 비밀번호
 - **WHEN** 세션의 `USERNAME`은 맞지만 다른 비밀번호로 서명한 Binding 요청이 도착한다
@@ -46,6 +46,18 @@
 #### Scenario: 임의 바이트
 - **WHEN** 무작위 바이트로 채운 UDP 패킷이 도착한다
 - **THEN** 서버는 응답하지 않고 계속 다른 요청을 처리한다
+
+#### Scenario: 연결된 세션의 RTCP
+- **WHEN** DTLS가 완료된 세션의 nominated pair의 브라우저 주소에서 둘째 바이트가 201(RR)인 패킷이 도착한다
+- **THEN** 서버는 그 패킷을 해당 세션의 RTCP 처리로 넘긴다
+
+#### Scenario: DTLS 완료 전의 RTCP
+- **WHEN** nomination은 받았지만 DTLS가 완료되지 않은 세션의 브라우저 주소에서 RTCP 패킷이 도착한다
+- **THEN** 서버는 그 패킷을 버리고 그 주소에 대해 처음 한 번만 로그를 남긴다
+
+#### Scenario: RTP 패킷
+- **WHEN** DTLS가 완료된 세션의 nominated pair의 브라우저 주소에서 둘째 바이트가 RTCP 범위가 아닌 RTP 패킷이 도착한다
+- **THEN** 서버는 그 패킷을 버린다
 
 ### Requirement: 연결 수립 기록
 서버는 세션에서 `USE-CANDIDATE` 속성이 있는 유효한 Binding 요청을 처음 받으면 그 세션을 연결됨 상태로 바꾸고, 세션과 브라우저 주소를 로그에 남겨야 한다(SHALL). 처음 nomination을 받은 pair(브라우저 주소와 요청이 도착한 서버 주소)를 세션의 DTLS 경로로 고정하며, 이후 다른 pair에 대한 `USE-CANDIDATE`가 와도 성공 응답만 보내고 경로는 바꾸지 않는다.
