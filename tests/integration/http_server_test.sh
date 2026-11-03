@@ -168,17 +168,20 @@ expect_equal "chunked POST /offer" "501" \
 expect_equal "큰 본문 POST /offer" "413" \
     "$(printf 'POST /offer HTTP/1.1\r\nContent-Length: 100000\r\n\r\n' | raw_status)"
 
-# 동영상 목록과 선택. 이 서버는 --video-dir 없이 실행했으므로 목록이 비어 있다.
-expect_equal "동영상 없는 서버의 목록" '{"videos":[]}' "$(curl -s "${base_url}/api/videos")"
-expect_equal "목록 Content-Type" "application/json" "$(header_of /api/videos Content-Type)"
-expect_equal "POST /api/videos는 405" "405" "$(status_of /api/videos -X POST -H 'Content-Length: 0')"
-expect_equal "POST /api/videos의 Allow 헤더" "GET" \
-    "$(curl -s -D - -o /dev/null -X POST -H 'Content-Length: 0' "${base_url}/api/videos" |
+# 소스 목록과 선택. 이 서버는 --video-dir 없이 실행했으므로 목록이 비어 있다.
+expect_equal "소스 없는 서버의 목록" '{"sources":[]}' "$(curl -s "${base_url}/api/sources")"
+expect_equal "목록 Content-Type" "application/json" "$(header_of /api/sources Content-Type)"
+expect_equal "POST /api/sources는 405" "405" "$(status_of /api/sources -X POST -H 'Content-Length: 0')"
+expect_equal "POST /api/sources의 Allow 헤더" "GET" \
+    "$(curl -s -D - -o /dev/null -X POST -H 'Content-Length: 0' "${base_url}/api/sources" |
         tr -d '\r' | grep -i '^Allow:' | cut -d ' ' -f 2-)"
-expect_equal "목록에 없는 동영상 offer" "404" \
-    "$(status_of '/offer?video=missing.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
-expect_equal "잘못된 video 인코딩 offer" "400" \
-    "$(status_of '/offer?video=%zz' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "이전 목록 경로 /api/videos는 404" "404" "$(status_of /api/videos)"
+expect_equal "목록에 없는 소스 offer" "404" \
+    "$(status_of '/offer?type=file&id=missing.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "잘못된 id 인코딩 offer" "400" \
+    "$(status_of '/offer?type=file&id=%zz' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "type 없는 offer" "400" \
+    "$(status_of '/offer?id=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 
 # 요청을 끝내지 않은 연결이 있어도 다른 요청은 바로 처리되어야 한다.
 # nc만 백그라운드 작업으로 두어야 nc를 종료한 뒤 남은 sleep을 기다리지 않는다.
@@ -243,10 +246,11 @@ for _ in $(seq 50); do
     fi
     sleep 0.1
 done
-expect_equal "디렉터리의 동영상 목록" '{"videos":[{"id":"a.h264","frames":1},{"id":"b.h264","frames":1}]}' \
-    "$(curl -s "${base_url}/api/videos")"
-expect_equal "목록에 있는 동영상 offer" "200" \
-    "$(status_of '/offer?video=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "디렉터리의 소스 목록" \
+    '{"sources":[{"type":"file","id":"a.h264","frames":1},{"type":"file","id":"b.h264","frames":1}]}' \
+    "$(curl -s "${base_url}/api/sources")"
+expect_equal "목록에 있는 소스 offer" "200" \
+    "$(status_of '/offer?type=file&id=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 expect_equal "잘못된 파일 건너뜀 경고" "1" "$(grep -c '^경고: .*bad\.h264' "${server_log}")"
 kill -TERM "${server_pid}"
 wait "${server_pid}"

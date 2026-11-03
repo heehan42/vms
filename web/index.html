@@ -11,10 +11,10 @@
     <p id="script-status">app.js를 불러오지 못했습니다.</p>
 
     <h2>연결 확인</h2>
-    <!-- app.js가 GET /api/videos로 받은 목록으로 option 요소를 채운다. 연결 버튼을 누르면 고른 동영상으로
-         새 연결을 맺는다. 목록 요청이 끝나기 전에 동영상 없이 연결되지 않도록 버튼은 비활성 상태로 시작한다. -->
-    <label for="video-select">동영상</label>
-    <select id="video-select" disabled>
+    <!-- app.js가 GET /api/sources로 받은 목록으로 option 요소를 채운다. 연결 버튼을 누르면 고른 소스로
+         새 연결을 맺는다. 목록 요청이 끝나기 전에 소스 없이 연결되지 않도록 버튼은 비활성 상태로 시작한다. -->
+    <label for="source-select">소스</label>
+    <select id="source-select" disabled>
         <option value="">목록을 불러오는 중</option>
     </select>
     <button id="connect-button" type="button" disabled>연결</button>

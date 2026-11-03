@@ -299,7 +299,7 @@ int main(int argc, char* argv[]) {
     endpoints.post.emplace("/offer", [&signaling](const HttpRequest& request, std::string_view body) {
         return signaling.HandleOffer(request, body);
     });
-    endpoints.get.emplace("/api/videos", [&signaling](const HttpRequest&) { return signaling.HandleVideoList(); });
+    endpoints.get.emplace("/api/sources", [&signaling](const HttpRequest&) { return signaling.HandleSourceList(); });
 
     auto server = HttpServer::Start(*loop, options->http, std::move(endpoints));
     if (!server) {

@@ -80,48 +80,63 @@ HttpStatus PostOffer(Signaling& signaling, std::string_view target, std::string_
 }
 
 
-// video 매개변수에 따라 offer를 받아들이거나 거부하는지 검사한다.
+// type·id 매개변수에 따라 offer를 받아들이거나 거부하는지 검사한다.
 //
 // signaling: 동영상 세 개(a.h264, b.h264, kKoreanVideoId)가 있는 엔드포인트
 // offer: Chrome offer 견본
-void TestOfferVideoParameter(Signaling& signaling, std::string_view offer) {
-    Expect(PostOffer(signaling, "/offer?video=a.h264", offer) == HttpStatus::kOk, "목록에 있는 ID는 200");
-    Expect(PostOffer(signaling, "/offer?video=%EC%8B%9C%ED%97%98%20%221%22.h264", offer) == HttpStatus::kOk,
+void TestOfferSourceParameter(Signaling& signaling, std::string_view offer) {
+    Expect(PostOffer(signaling, "/offer?type=file&id=a.h264", offer) == HttpStatus::kOk, "목록에 있는 파일은 200");
+    Expect(PostOffer(signaling, "/offer?type=file&id=%EC%8B%9C%ED%97%98%20%221%22.h264", offer) == HttpStatus::kOk,
            "encodeURIComponent로 인코딩한 한글 ID는 200");
-    Expect(PostOffer(signaling, "/offer", offer) == HttpStatus::kOk, "video가 없으면 동영상 없는 세션으로 200");
+    Expect(PostOffer(signaling, "/offer", offer) == HttpStatus::kOk, "type·id가 없으면 소스 없는 세션으로 200");
+    Expect(PostOffer(signaling, "/offer?video=a.h264", offer) == HttpStatus::kOk, "이전 형식의 video는 무시해 200");
+    Expect(PostOffer(signaling, "/offer?video=a.h264&video=b.h264", offer) == HttpStatus::kOk,
+           "중복된 video도 무시해 200");
 
-    Expect(PostOffer(signaling, "/offer?video=missing.h264", offer) == HttpStatus::kNotFound, "목록에 없는 ID는 404");
-    Expect(PostOffer(signaling, "/offer?video=..%2Fsecret.h264", offer) == HttpStatus::kNotFound,
+    Expect(PostOffer(signaling, "/offer?type=file&id=missing.h264", offer) == HttpStatus::kNotFound,
+           "목록에 없는 ID는 404");
+    Expect(PostOffer(signaling, "/offer?type=file&id=..%2Fsecret.h264", offer) == HttpStatus::kNotFound,
            "경로처럼 보이는 ID는 404");
-    Expect(PostOffer(signaling, "/offer?video=A.h264", offer) == HttpStatus::kNotFound, "대소문자가 다르면 404");
-    Expect(PostOffer(signaling, "/offer?video=%zz", offer) == HttpStatus::kBadRequest, "잘못된 퍼센트 인코딩은 400");
-    Expect(PostOffer(signaling, "/offer?video=a.h264&video=b.h264", offer) == HttpStatus::kBadRequest,
-           "중복된 video는 400");
+    Expect(PostOffer(signaling, "/offer?type=file&id=A.h264", offer) == HttpStatus::kNotFound,
+           "대소문자가 다르면 404");
+    Expect(PostOffer(signaling, "/offer?type=camera&id=a.h264", offer) == HttpStatus::kNotFound,
+           "종류가 다른 소스는 404");
 
-    // 판정 순서: Content-Type → video → SDP
-    Expect(PostOffer(signaling, "/offer?video=missing.h264", offer, "text/plain") ==
+    Expect(PostOffer(signaling, "/offer?type=disk&id=a.h264", offer) == HttpStatus::kBadRequest,
+           "알 수 없는 종류는 400");
+    Expect(PostOffer(signaling, "/offer?id=a.h264", offer) == HttpStatus::kBadRequest, "id만 있으면 400");
+    Expect(PostOffer(signaling, "/offer?type=file", offer) == HttpStatus::kBadRequest, "type만 있으면 400");
+    Expect(PostOffer(signaling, "/offer?type=file&id=%zz", offer) == HttpStatus::kBadRequest,
+           "잘못된 퍼센트 인코딩은 400");
+    Expect(PostOffer(signaling, "/offer?type=file&id=a.h264&id=b.h264", offer) == HttpStatus::kBadRequest,
+           "중복된 id는 400");
+    Expect(PostOffer(signaling, "/offer?type=file&type=file&id=a.h264", offer) == HttpStatus::kBadRequest,
+           "중복된 type은 400");
+
+    // 판정 순서: Content-Type → 소스 → SDP
+    Expect(PostOffer(signaling, "/offer?type=file&id=missing.h264", offer, "text/plain") ==
                HttpStatus::kUnsupportedMediaType,
-           "Content-Type을 video보다 먼저 검사");
-    Expect(PostOffer(signaling, "/offer?video=missing.h264", "hello") == HttpStatus::kNotFound,
-           "video를 SDP보다 먼저 검사");
-    Expect(PostOffer(signaling, "/offer?video=a.h264", "hello") == HttpStatus::kBadRequest,
-           "video가 맞아도 SDP가 잘못되면 400");
+           "Content-Type을 소스보다 먼저 검사");
+    Expect(PostOffer(signaling, "/offer?type=file&id=missing.h264", "hello") == HttpStatus::kNotFound,
+           "소스를 SDP보다 먼저 검사");
+    Expect(PostOffer(signaling, "/offer?type=file&id=a.h264", "hello") == HttpStatus::kBadRequest,
+           "소스가 맞아도 SDP가 잘못되면 400");
 }
 
 
-// 동영상 목록 JSON의 순서, 프레임 수, 이스케이프를 검사한다.
+// 소스 목록 JSON의 순서, 종류, 프레임 수, 이스케이프를 검사한다.
 //
 // signaling: 동영상 세 개가 있는 엔드포인트
-void TestVideoList(const Signaling& signaling) {
-    const auto response = signaling.HandleVideoList();
+void TestSourceList(const Signaling& signaling) {
+    const auto response = signaling.HandleSourceList();
     Expect(response.status == HttpStatus::kOk, "목록 200");
     Expect(response.content_type == "application/json", "목록 Content-Type");
-    Expect(response.body == "{\"videos\":["
-                            "{\"id\":\"a.h264\",\"frames\":2},"
-                            "{\"id\":\"b.h264\",\"frames\":1},"
-                            "{\"id\":\"\xEC\x8B\x9C\xED\x97\x98 \\\"1\\\".h264\",\"frames\":1}"
+    Expect(response.body == "{\"sources\":["
+                            "{\"type\":\"file\",\"id\":\"a.h264\",\"frames\":2},"
+                            "{\"type\":\"file\",\"id\":\"b.h264\",\"frames\":1},"
+                            "{\"type\":\"file\",\"id\":\"\xEC\x8B\x9C\xED\x97\x98 \\\"1\\\".h264\",\"frames\":1}"
                             "]}",
-           "이름의 바이트 순서, 프레임 수, 큰따옴표 이스케이프");
+           "이름의 바이트 순서, 종류, 프레임 수, 큰따옴표 이스케이프");
 }
 
 
@@ -164,13 +179,13 @@ int main() {
     }
 
     Signaling signaling(**agent, *certificate, loaded->library);
-    TestOfferVideoParameter(signaling, offer);
-    TestVideoList(signaling);
+    TestOfferSourceParameter(signaling, offer);
+    TestSourceList(signaling);
 
     const VideoLibrary empty_library;
     Signaling empty_signaling(**agent, *certificate, empty_library);
-    Expect(empty_signaling.HandleVideoList().body == "{\"videos\":[]}", "동영상 없이 실행하면 빈 배열");
-    Expect(PostOffer(empty_signaling, "/offer", offer) == HttpStatus::kOk, "빈 목록에서도 video 없는 offer는 200");
+    Expect(empty_signaling.HandleSourceList().body == "{\"sources\":[]}", "소스 없이 실행하면 빈 배열");
+    Expect(PostOffer(empty_signaling, "/offer", offer) == HttpStatus::kOk, "빈 목록에서도 type·id 없는 offer는 200");
 
     // 에이전트는 루프, DTLS 컨텍스트, 동영상 목록보다 먼저 소멸해야 한다.
     agent->reset();

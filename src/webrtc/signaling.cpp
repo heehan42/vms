@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <format>
 #include <iterator>
+#include <optional>
 #include <print>
 #include <string>
 
@@ -76,29 +77,76 @@ std::expected<std::uint8_t, std::string> ParsePayloadType(std::string_view paylo
 }
 
 
-// offer 요청의 video 쿼리 매개변수로 세션에 보낼 동영상을 찾는다.
+// API의 소스 종류. 목록 원소와 offer 요청의 type 문자열에 대응한다.
+enum class SourceType {
+    // 동영상 파일. type 문자열은 "file"
+    kFile,
+    // 카메라. type 문자열은 "camera"
+    kCamera,
+};
+
+
+// offer 요청의 type 매개변수 값을 소스 종류로 바꾼다.
+//
+// type: 디코딩한 type 매개변수 값
+// 반환값: 대소문자까지 같은 종류. "file"·"camera"가 아니면 std::nullopt
+std::optional<SourceType> ParseSourceType(std::string_view type) {
+    if (type == "file") {
+        return SourceType::kFile;
+    }
+    if (type == "camera") {
+        return SourceType::kCamera;
+    }
+    return std::nullopt;
+}
+
+
+// 쿼리 매개변수 해석 오류를 로그 문구로 바꾼다.
+//
+// error: FindQueryParameter가 돌려준 오류
+// 반환값: 오류 원인 문구
+std::string_view DescribeQueryParameterError(http::QueryParameterError error) {
+    return error == http::QueryParameterError::kDuplicate ? "두 번 이상 옴" : "잘못된 퍼센트 인코딩";
+}
+
+
+// offer 요청의 type·id 쿼리 매개변수로 세션에 보낼 소스를 찾는다.
 //
 // target: 요청 대상 원문
-// video_library: 찾을 동영상 목록
-// 반환값: 찾은 항목. video가 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404(원인을 로그에 남김)
+// video_library: 파일 소스를 찾을 동영상 목록
+// 반환값: 찾은 파일 항목. type·id가 모두 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404
+//   (원인을 로그에 남김)
 //
-// 디코딩한 값은 목록 ID와 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도 목록에 없어 404가 된다.
-std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedVideo(std::string_view target,
-                                                                            const media::VideoLibrary& video_library) {
-    const auto video_id = http::FindQueryParameter(target, "video");
-    if (!video_id) {
-        std::println(stderr, "offer 거부: video 매개변수 해석 실패 ({}): {}", target,
-                     video_id.error() == http::QueryParameterError::kDuplicate ? "두 번 이상 옴"
-                                                                               : "잘못된 퍼센트 인코딩");
+// 해석 오류(인코딩·중복, 한쪽만 옴, 알 수 없는 종류)를 존재 여부보다 먼저 판정한다. 카메라 목록은 아직 없으므로
+// type=camera는 항상 404다. 디코딩한 id는 목록 ID와 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도
+// 목록에 없어 404가 된다.
+std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
+    std::string_view target, const media::VideoLibrary& video_library) {
+    const auto type = http::FindQueryParameter(target, "type");
+    const auto id = http::FindQueryParameter(target, "id");
+    if (!type || !id) {
+        std::println(stderr, "offer 거부: {} 매개변수 해석 실패 ({}): {}", !type ? "type" : "id", target,
+                     DescribeQueryParameterError(!type ? type.error() : id.error()));
         return std::unexpected(http::HttpStatus::kBadRequest);
     }
-    if (!*video_id) {
+    if (!*type && !*id) {
         return nullptr;
     }
+    if (!*type || !*id) {
+        std::println(stderr, "offer 거부: type·id 중 하나만 옴 ({})", target);
+        return std::unexpected(http::HttpStatus::kBadRequest);
+    }
 
-    const media::VideoEntry* const entry = video_library.Find(**video_id);
+    const std::optional<SourceType> source_type = ParseSourceType(**type);
+    if (!source_type) {
+        std::println(stderr, "offer 거부: 알 수 없는 소스 종류 ({})", target);
+        return std::unexpected(http::HttpStatus::kBadRequest);
+    }
+
+    const media::VideoEntry* const entry =
+        *source_type == SourceType::kFile ? video_library.Find(**id) : nullptr;
     if (entry == nullptr) {
-        std::println(stderr, "offer 거부: 목록에 없는 동영상 ({})", target);
+        std::println(stderr, "offer 거부: 목록에 없는 소스 ({})", target);
         return std::unexpected(http::HttpStatus::kNotFound);
     }
     return entry;
@@ -121,8 +169,8 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
         return http::HttpEndpointResponse::Error(http::HttpStatus::kUnsupportedMediaType);
     }
 
-    // 동영상 확인은 SDP 해석보다 가벼우므로 먼저 한다.
-    const auto video = FindRequestedVideo(request.target, video_library_);
+    // 소스 확인은 SDP 해석보다 가벼우므로 먼저 한다.
+    const auto video = FindRequestedSource(request.target, video_library_);
     if (!video) {
         return http::HttpEndpointResponse::Error(video.error());
     }
@@ -176,13 +224,13 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
 }
 
 
-http::HttpEndpointResponse Signaling::HandleVideoList() const {
-    std::string body = R"({"videos":[)";
+http::HttpEndpointResponse Signaling::HandleSourceList() const {
+    std::string body = R"({"sources":[)";
     for (const media::VideoEntry& entry : video_library_.Entries()) {
         if (&entry != &video_library_.Entries().front()) {
             body.push_back(',');
         }
-        body.append(R"({"id":)");
+        body.append(R"({"type":"file","id":)");
         core::AppendJsonString(body, entry.id);
         std::format_to(std::back_inserter(body), R"(,"frames":{}}})", entry.file.Frames().size());
     }

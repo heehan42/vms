@@ -1,7 +1,7 @@
 // 서버가 HTML과 별도 스크립트 파일을 모두 전달했는지 화면에서 확인할 수 있게 한다.
 document.getElementById("script-status").textContent = "app.js가 실행되었습니다.";
 
-const videoSelect = document.getElementById("video-select");
+const sourceSelect = document.getElementById("source-select");
 const connectButton = document.getElementById("connect-button");
 const signalingStatus = document.getElementById("signaling-status");
 const iceState = document.getElementById("ice-state");
@@ -12,6 +12,15 @@ const remoteVideo = document.getElementById("remote-video");
 
 // 연결 버튼을 다시 누르면 이전 연결을 닫고 새로 시작하기 위해 보관한다.
 let peerConnection = null;
+
+// GET /api/sources로 받은 소스 배열. option 요소의 값은 이 배열의 인덱스다.
+//
+// ID에 어떤 문자가 와도 종류와 ID를 따로 꺼낼 수 있도록, option 값에 둘을 이어 붙이지 않고 인덱스만 둔다.
+// 페이지가 열릴 때 한 번만 채우므로 인덱스는 바뀌지 않는다.
+let sources = [];
+
+// 목록의 type 값별로 option 요소에 표시할 종류 이름
+const sourceTypeNames = {file: "파일", camera: "카메라"};
 
 // 연결의 transport 통계에서 DTLS 상태와 SRTP 암호를 읽어 화면에 표시한다.
 //
@@ -34,41 +43,41 @@ async function showTransportStats(connection) {
 // select 요소의 option 요소를 모두 지우고, 값이 빈 안내 option 요소 하나만 둔 채 비활성화한다.
 //
 // message: 안내 option 요소에 표시할 문구
-function showVideoSelectMessage(message) {
+function showSourceSelectMessage(message) {
     const option = document.createElement("option");
     option.value = "";
     option.textContent = message;
-    videoSelect.replaceChildren(option);
-    videoSelect.disabled = true;
+    sourceSelect.replaceChildren(option);
+    sourceSelect.disabled = true;
 }
 
-// 서버의 동영상 목록을 받아 select 요소를 채운다. 첫 동영상이 선택된 상태가 된다.
+// 서버의 소스 목록을 받아 select 요소를 채운다. 첫 소스가 선택된 상태가 된다.
 //
-// 동영상 ID는 파일 이름이라 HTML로 해석되면 안 되므로 textContent로만 넣는다.
-async function loadVideoList() {
-    const response = await fetch("/api/videos");
+// 소스 ID는 파일 이름 등이라 HTML로 해석되면 안 되므로 textContent로만 넣는다.
+async function loadSourceList() {
+    const response = await fetch("/api/sources");
     if (!response.ok) {
         throw new Error(`${response.status} ${response.statusText}`);
     }
-    const {videos} = await response.json();
-    if (videos.length === 0) {
-        showVideoSelectMessage("동영상 없음");
+    ({sources} = await response.json());
+    if (sources.length === 0) {
+        showSourceSelectMessage("소스 없음");
         return;
     }
-    const options = videos.map((video) => {
+    const options = sources.map((source, index) => {
         const option = document.createElement("option");
-        option.value = video.id;
-        option.textContent = video.id;
+        option.value = String(index);
+        option.textContent = `${sourceTypeNames[source.type] ?? source.type} · ${source.id}`;
         return option;
     });
-    videoSelect.replaceChildren(...options);
-    videoSelect.disabled = false;
+    sourceSelect.replaceChildren(...options);
+    sourceSelect.disabled = false;
 }
 
 // 수신 전용 비디오 트랜시버로 offer를 만들어 서버에 보내고, answer를 적용해 ICE 연결을 시작한다.
 //
-// select 요소에서 고른 동영상 ID를 video 쿼리 매개변수로 붙인다. 고른 값이 없으면(목록이 비었거나 받지
-// 못함) 붙이지 않으며, 서버는 동영상 없이 연결만 맺는다.
+// select 요소에서 고른 소스의 type과 id를 같은 이름의 쿼리 매개변수로 붙인다. 고른 값이 없으면(목록이
+// 비었거나 받지 못함) 붙이지 않으며, 서버는 소스 없이 연결만 맺는다.
 //
 // 서버는 ICE-lite라 브라우저 candidate를 쓰지 않으므로, 후보 수집을 기다리지 않고 offer를 바로 보낸다.
 async function connect() {
@@ -111,8 +120,10 @@ async function connect() {
     showStates();
 
     signalingStatus.textContent = "offer 전송 중";
-    const videoId = videoSelect.value;
-    const offerUrl = videoId ? `/offer?video=${encodeURIComponent(videoId)}` : "/offer";
+    const source = sourceSelect.value === "" ? undefined : sources[Number(sourceSelect.value)];
+    const offerUrl = source
+        ? `/offer?type=${encodeURIComponent(source.type)}&id=${encodeURIComponent(source.id)}`
+        : "/offer";
     const response = await fetch(offerUrl, {
         method: "POST",
         headers: {"Content-Type": "application/sdp"},
@@ -128,10 +139,10 @@ async function connect() {
     showStates();
 }
 
-// 목록이 비었거나 요청이 실패해도 동영상 없이 연결을 확인할 수 있어야 하므로, 끝나면 항상 버튼을 켠다.
-loadVideoList()
+// 목록이 비었거나 요청이 실패해도 소스 없이 연결을 확인할 수 있어야 하므로, 끝나면 항상 버튼을 켠다.
+loadSourceList()
     .catch((error) => {
-        showVideoSelectMessage(`목록을 불러오지 못함: ${error.message}`);
+        showSourceSelectMessage(`목록을 불러오지 못함: ${error.message}`);
     })
     .finally(() => {
         connectButton.disabled = false;

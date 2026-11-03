@@ -117,6 +117,29 @@ ffmpeg -f lavfi -i smptebars=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v
 - fps는 모든 파일에 같은 값을 쓰므로, 같은 fps로 만든 파일만 디렉터리에 둡니다. 다르면 빠르거나 느리게 재생됩니다.
 - 디렉터리는 시작할 때 한 번만 읽습니다. 파일을 추가하거나 지웠으면 서버를 다시 시작합니다.
 
+### 소스 목록과 선택 API
+
+웹 페이지는 `GET /api/sources`로 소스 목록을 받고, 고른 소스의 종류(`type`)와 ID(`id`)를 `POST /offer`의
+쿼리 매개변수로 보냅니다. `type`은 `file`(동영상 파일) 또는 `camera`(카메라)이며, 지금은 `file`만 목록에 나옵니다.
+`frames`(프레임 수)는 `file` 원소에만 있습니다.
+
+```bash
+curl -s http://localhost:8080/api/sources
+```
+
+```json
+{"sources":[{"type":"file","id":"color_bars.h264","frames":300},{"type":"file","id":"test_pattern.h264","frames":300}]}
+```
+
+| `POST /offer` 요청 대상 | 결과 |
+|---|---|
+| `/offer?type=file&id=color_bars.h264` | 그 파일을 보내는 세션 |
+| `/offer` | 영상 없는 세션. 이전 형식의 `video` 매개변수도 무시하므로 같은 결과입니다 |
+| `type`·`id` 중 하나만 있음, 같은 이름이 두 번 옴, 퍼센트 인코딩 오류, `type`이 `file`·`camera`가 아님 | `400` |
+| 종류와 ID가 맞는 소스가 없음(`type=camera`는 아직 항상 해당) | `404` |
+
+ID에 한글이나 `&` 같은 문자가 있으면 값을 퍼센트 인코딩합니다(브라우저의 `encodeURIComponent`).
+
 ## WSL2에서 실행하기
 
 WSL2 기본 네트워크 모드(NAT)에서 확인한 결과 별도 설정 없이 동작합니다.
@@ -132,9 +155,9 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
 
 1. 서버를 실행하고 Windows Chrome에서 `http://localhost:8080/`에 접속합니다.
    "app.js가 실행되었습니다." 문구가 보이면 페이지와 스크립트가 정상적으로 전달된 것입니다.
-   **동영상** 선택 목록에는 서버의 동영상이 이름순으로 나오고 첫 동영상이 선택되어 있습니다.
-   `--video-dir` 없이 실행했으면 "동영상 없음"이 표시되며, 연결은 영상 없이 맺어집니다.
-2. 동영상을 고르고 **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
+   **소스** 선택 목록에는 서버의 동영상이 "파일 · <ID>" 형식으로 이름순으로 나오고 첫 항목이 선택되어 있습니다.
+   `--video-dir` 없이 실행했으면 "소스 없음"이 표시되며, 연결은 영상 없이 맺어집니다.
+2. 소스를 고르고 **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
    서버 로그에는 `ICE 연결됨: ...`이 남습니다.
 3. 이어서 DTLS 핸드셰이크가 끝나면 연결 상태(`connectionState`)가 `connected`가 되고,
    페이지에 DTLS 상태 `connected`와 SRTP 암호 `SRTP_AES128_CM_HMAC_SHA1_80`이 표시됩니다.
@@ -147,9 +170,9 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
    | `dtlsRole` | `client` | 서버가 answer에서 `a=setup:passive`로 DTLS 서버를 맡으므로 브라우저는 클라이언트 |
    | `srtpCipher` | `SRTP_AES128_CM_HMAC_SHA1_80` | 협상한 SRTP 프로파일 |
 
-5. 동영상을 골랐다면 페이지의 영상 영역에 그 동영상이 표시되고, 파일 끝에서 처음부터 반복됩니다.
+5. 소스를 골랐다면 페이지의 영상 영역에 그 동영상이 표시되고, 파일 끝에서 처음부터 반복됩니다.
    서버 로그에는 `송신 시작: 세션 ..., 동영상 <ID>, SSRC ..., payload type ...`이 남습니다.
-   다른 동영상을 보려면 목록에서 고른 뒤 **연결** 버튼을 다시 누릅니다. 새 연결을 맺어 처음부터 재생합니다.
+   다른 소스를 보려면 목록에서 고른 뒤 **연결** 버튼을 다시 누릅니다. 새 연결을 맺어 처음부터 재생합니다.
    `chrome://webrtc-internals`의 inbound-rtp(video) 통계에서 다음을 확인합니다.
 
    | 항목 | 기대값 | 의미 |
