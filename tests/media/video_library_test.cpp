@@ -105,7 +105,7 @@ void TestSelectsAndSortsFiles(const fs::path& root) {
     const auto& entries = loaded->library.Entries();
     Expect(entries.size() == 3, "대상 파일은 .h264, .264, .H264 세 개");
     if (entries.size() == 3) {
-        Expect(entries[0].id == "A.264" && entries[1].id == "b.h264" && entries[2].id == "upper.H264",
+        Expect(entries[0].name == "A.264" && entries[1].name == "b.h264" && entries[2].name == "upper.H264",
                "이름의 바이트 순서(대문자가 앞)");
         Expect(entries[0].file.Frames().size() == 1 && entries[1].file.Frames().size() == 3,
                "항목마다 자기 파일의 프레임");
@@ -131,7 +131,7 @@ void TestSkipsInvalidFiles(const fs::path& root) {
         return;
     }
     const auto& entries = loaded->library.Entries();
-    Expect(entries.size() == 1 && entries[0].id == "ok.h264", "목록에는 ok.h264만 남는다");
+    Expect(entries.size() == 1 && entries[0].name == "ok.h264", "목록에는 ok.h264만 남는다");
     Expect(loaded->warnings.size() == 4, "건너뛴 파일마다 경고 하나");
     Expect(HasWarning(loaded->warnings, "bad.h264", "NAL"), "NAL이 없는 파일 경고");
     Expect(HasWarning(loaded->warnings, "no_idr.h264", "IDR"), "첫 프레임 조건 경고");
@@ -153,7 +153,7 @@ void TestTotalSizeLimit(const fs::path& root) {
         return;
     }
     const auto& entries = loaded->library.Entries();
-    Expect(entries.size() == 2 && entries[1].id == "2.h264", "앞의 두 파일만 넣는다");
+    Expect(entries.size() == 2 && entries[1].name == "2.h264", "앞의 두 파일만 넣는다");
     Expect(loaded->warnings.size() == 1 && HasWarning(loaded->warnings, "3.h264", "합계"), "세 번째 파일 경고");
 }
 
@@ -176,7 +176,7 @@ void TestLoadErrors(const fs::path& root) {
 }
 
 
-// ID로 항목을 찾는지 검사한다.
+// 이름으로 항목을 찾는지 검사한다.
 void TestFind(const fs::path& root) {
     const fs::path directory = MakeCaseDirectory(root, "find");
     WriteVideo(directory / "\xEC\x8B\x9C\xED\x97\x98.h264", 1);
@@ -189,8 +189,8 @@ void TestFind(const fs::path& root) {
     }
     const VideoLibrary& library = loaded->library;
     const auto* found = library.Find("\xEC\x8B\x9C\xED\x97\x98.h264");
-    Expect(found != nullptr && found == &library.Entries()[1], "한글 ID로 찾음");
-    Expect(library.Find("a.h264") == &library.Entries()[0], "ASCII ID로 찾음");
+    Expect(found != nullptr && found == &library.Entries()[1], "한글 이름으로 찾음");
+    Expect(library.Find("a.h264") == &library.Entries()[0], "ASCII 이름으로 찾음");
     Expect(library.Find("A.h264") == nullptr, "대소문자가 다르면 없음");
     Expect(library.Find("../find/a.h264") == nullptr, "경로처럼 보이는 값은 없음");
     Expect(VideoLibrary().Find("a.h264") == nullptr && VideoLibrary().Entries().empty(), "빈 목록");

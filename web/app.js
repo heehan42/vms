@@ -15,7 +15,7 @@ let peerConnection = null;
 
 // GET /api/sources로 받은 소스 배열. option 요소의 값은 이 배열의 인덱스다.
 //
-// ID에 어떤 문자가 와도 종류와 ID를 따로 꺼낼 수 있도록, option 값에 둘을 이어 붙이지 않고 인덱스만 둔다.
+// 이름에 어떤 문자가 와도 종류와 이름을 따로 꺼낼 수 있도록, option 값에 둘을 이어 붙이지 않고 인덱스만 둔다.
 // 페이지가 열릴 때 한 번만 채우므로 인덱스는 바뀌지 않는다.
 let sources = [];
 
@@ -53,7 +53,7 @@ function showSourceSelectMessage(message) {
 
 // 서버의 소스 목록을 받아 select 요소를 채운다. 첫 소스가 선택된 상태가 된다.
 //
-// 소스 ID는 파일 이름 등이라 HTML로 해석되면 안 되므로 textContent로만 넣는다.
+// 소스 이름은 파일 이름 등이라 HTML로 해석되면 안 되므로 textContent로만 넣는다.
 async function loadSourceList() {
     const response = await fetch("/api/sources");
     if (!response.ok) {
@@ -67,7 +67,7 @@ async function loadSourceList() {
     const options = sources.map((source, index) => {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = `${sourceTypeNames[source.type] ?? source.type} · ${source.id}`;
+        option.textContent = `${sourceTypeNames[source.type] ?? source.type} · ${source.name}`;
         return option;
     });
     sourceSelect.replaceChildren(...options);
@@ -76,7 +76,7 @@ async function loadSourceList() {
 
 // 수신 전용 비디오 트랜시버로 offer를 만들어 서버에 보내고, answer를 적용해 ICE 연결을 시작한다.
 //
-// select 요소에서 고른 소스의 type과 id를 같은 이름의 쿼리 매개변수로 붙인다. 고른 값이 없으면(목록이
+// select 요소에서 고른 소스의 type과 name을 같은 이름의 쿼리 매개변수로 붙인다. 고른 값이 없으면(목록이
 // 비었거나 받지 못함) 붙이지 않으며, 서버는 소스 없이 연결만 맺는다.
 //
 // 서버는 ICE-lite라 브라우저 candidate를 쓰지 않으므로, 후보 수집을 기다리지 않고 offer를 바로 보낸다.
@@ -122,7 +122,7 @@ async function connect() {
     signalingStatus.textContent = "offer 전송 중";
     const source = sourceSelect.value === "" ? undefined : sources[Number(sourceSelect.value)];
     const offerUrl = source
-        ? `/offer?type=${encodeURIComponent(source.type)}&id=${encodeURIComponent(source.id)}`
+        ? `/offer?type=${encodeURIComponent(source.type)}&name=${encodeURIComponent(source.name)}`
         : "/offer";
     const response = await fetch(offerUrl, {
         method: "POST",

@@ -72,8 +72,8 @@ struct IceSessionRequest {
     const media::H264File* video = nullptr;
 
 
-    // video의 ID. 송신 시작 로그에 쓰며, 세션이 복사해 보관한다. video가 nullptr이면 쓰지 않는다.
-    std::string_view video_id;
+    // video의 이름. 송신 시작 로그에 쓰며, 세션이 복사해 보관한다. video가 nullptr이면 쓰지 않는다.
+    std::string_view video_name;
 };
 
 
@@ -323,8 +323,8 @@ private:
         const media::H264File* video = nullptr;
 
 
-        // video의 ID. 송신 시작 로그에 쓴다.
-        std::string video_id;
+        // video의 이름. 송신 시작 로그에 쓴다.
+        std::string video_name;
 
 
         // 동영상 송신 상태. DTLS가 완료되고 동영상이 지정되어 있을 때 만들며, 송신을 멈추면 지운다.

@@ -105,7 +105,7 @@ std::expected<VideoLibraryLoadResult, std::string> VideoLibrary::LoadDirectory(c
             continue;
         }
         total_bytes += size;
-        entries.push_back(VideoEntry{.id = std::move(name), .file = *std::move(file)});
+        entries.push_back(VideoEntry{.name = std::move(name), .file = *std::move(file)});
     }
 
     if (entries.empty()) {
@@ -115,8 +115,8 @@ std::expected<VideoLibraryLoadResult, std::string> VideoLibrary::LoadDirectory(c
 }
 
 
-const VideoEntry* VideoLibrary::Find(std::string_view id) const {
-    const auto found = std::ranges::find(entries_, id, &VideoEntry::id);
+const VideoEntry* VideoLibrary::Find(std::string_view name) const {
+    const auto found = std::ranges::find(entries_, name, &VideoEntry::name);
     return found != entries_.end() ? &*found : nullptr;
 }
 

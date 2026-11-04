@@ -240,7 +240,7 @@ int main(int argc, char* argv[]) {
         }
         video_library = std::move(loaded->library);
         for (const auto& entry : video_library.Entries()) {
-            std::println(stderr, "동영상 로드: {}, 프레임 {}", entry.id, entry.file.Frames().size());
+            std::println(stderr, "동영상 로드: {}, 프레임 {}", entry.name, entry.file.Frames().size());
         }
         std::println(stderr, "동영상 목록: {}개, {}fps ({})", video_library.Entries().size(), options->video_fps,
                      options->video_dir->string());

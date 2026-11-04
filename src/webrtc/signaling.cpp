@@ -110,30 +110,30 @@ std::string_view DescribeQueryParameterError(http::QueryParameterError error) {
 }
 
 
-// offer 요청의 type·id 쿼리 매개변수로 세션에 보낼 소스를 찾는다.
+// offer 요청의 type·name 쿼리 매개변수로 세션에 보낼 소스를 찾는다.
 //
 // target: 요청 대상 원문
 // video_library: 파일 소스를 찾을 동영상 목록
-// 반환값: 찾은 파일 항목. type·id가 모두 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404
+// 반환값: 찾은 파일 항목. type·name이 모두 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404
 //   (원인을 로그에 남김)
 //
 // 해석 오류(인코딩·중복, 한쪽만 옴, 알 수 없는 종류)를 존재 여부보다 먼저 판정한다. 카메라 목록은 아직 없으므로
-// type=camera는 항상 404다. 디코딩한 id는 목록 ID와 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도
+// type=camera는 항상 404다. 디코딩한 name은 목록의 이름과 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도
 // 목록에 없어 404가 된다.
 std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
     std::string_view target, const media::VideoLibrary& video_library) {
     const auto type = http::FindQueryParameter(target, "type");
-    const auto id = http::FindQueryParameter(target, "id");
-    if (!type || !id) {
-        std::println(stderr, "offer 거부: {} 매개변수 해석 실패 ({}): {}", !type ? "type" : "id", target,
-                     DescribeQueryParameterError(!type ? type.error() : id.error()));
+    const auto name = http::FindQueryParameter(target, "name");
+    if (!type || !name) {
+        std::println(stderr, "offer 거부: {} 매개변수 해석 실패 ({}): {}", !type ? "type" : "name", target,
+                     DescribeQueryParameterError(!type ? type.error() : name.error()));
         return std::unexpected(http::HttpStatus::kBadRequest);
     }
-    if (!*type && !*id) {
+    if (!*type && !*name) {
         return nullptr;
     }
-    if (!*type || !*id) {
-        std::println(stderr, "offer 거부: type·id 중 하나만 옴 ({})", target);
+    if (!*type || !*name) {
+        std::println(stderr, "offer 거부: type·name 중 하나만 옴 ({})", target);
         return std::unexpected(http::HttpStatus::kBadRequest);
     }
 
@@ -144,7 +144,7 @@ std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
     }
 
     const media::VideoEntry* const entry =
-        *source_type == SourceType::kFile ? video_library.Find(**id) : nullptr;
+        *source_type == SourceType::kFile ? video_library.Find(**name) : nullptr;
     if (entry == nullptr) {
         std::println(stderr, "offer 거부: 목록에 없는 소스 ({})", target);
         return std::unexpected(http::HttpStatus::kNotFound);
@@ -197,7 +197,7 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
                                                                   .remote_fingerprint = offer->remote_fingerprint,
                                                                   .h264_payload_type = *payload_type,
                                                                   .video = *video ? &(*video)->file : nullptr,
-                                                                  .video_id = *video ? (*video)->id : ""})
+                                                                  .video_name = *video ? (*video)->name : ""})
                          : std::expected<IceSessionParameters, std::string>(std::unexpected(cname.error()));
     if (!session) {
         std::println(stderr, "ICE 세션 생성 실패: {}", session.error());
@@ -217,7 +217,7 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
 
     std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}, 동영상 {}",
                  session->ice_ufrag, offer->ice_ufrag, *payload_type, session->ssrc,
-                 *video ? std::string_view((*video)->id) : "없음");
+                 *video ? std::string_view((*video)->name) : "없음");
     return http::HttpEndpointResponse{.status = http::HttpStatus::kOk,
                                       .content_type = "application/sdp",
                                       .body = BuildSdpAnswer(*offer, parameters)};
@@ -230,8 +230,8 @@ http::HttpEndpointResponse Signaling::HandleSourceList() const {
         if (&entry != &video_library_.Entries().front()) {
             body.push_back(',');
         }
-        body.append(R"({"type":"file","id":)");
-        core::AppendJsonString(body, entry.id);
+        body.append(R"({"type":"file","name":)");
+        core::AppendJsonString(body, entry.name);
         std::format_to(std::back_inserter(body), R"(,"frames":{}}})", entry.file.Frames().size());
     }
     body.append("]}");

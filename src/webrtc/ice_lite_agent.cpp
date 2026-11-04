@@ -371,7 +371,7 @@ std::expected<IceSessionParameters, std::string> IceLiteAgent::CreateSession(
     session.ssrc = ssrc;
     session.h264_payload_type = request.h264_payload_type;
     session.video = request.video;
-    session.video_id = request.video != nullptr ? std::string(request.video_id) : std::string();
+    session.video_name = request.video != nullptr ? std::string(request.video_name) : std::string();
     session.last_activity_time = std::chrono::steady_clock::now();
     session.expiry_timer_id = ScheduleExpiryCheck(local_ufrag, session_timeout_);
     sessions_.emplace(local_ufrag, std::move(session));
@@ -815,7 +815,7 @@ void IceLiteAgent::StartVideoStream(SessionIterator session) {
     state.frame_timer_id =
         loop_.AddTimer(std::chrono::milliseconds(0), [this, local_ufrag] { HandleFrameTimer(local_ufrag); });
     std::println(stderr, "송신 시작: 세션 {}, 브라우저 {}, 동영상 {}, SSRC {}, payload type {}", local_ufrag,
-                 remote_text, state.video_id, state.ssrc, state.h264_payload_type);
+                 remote_text, state.video_name, state.ssrc, state.h264_payload_type);
 }
 
 

@@ -28,8 +28,8 @@ struct VideoLibraryLimits {
 
 // 동영상 목록의 항목 하나.
 struct VideoEntry {
-    // 동영상 ID. 디렉터리 안의 파일 이름이며 유효한 UTF-8이다.
-    std::string id;
+    // 동영상 이름. 디렉터리 안의 파일 이름이며 유효한 UTF-8이다.
+    std::string name;
 
 
     // 읽어 들인 파일. 프레임 뷰는 이 항목이 살아 있는 동안 유효하다.
@@ -68,11 +68,11 @@ public:
     VideoLibrary() = default;
 
 
-    // ID가 같은 항목을 찾는다.
+    // 이름이 같은 항목을 찾는다.
     //
-    // id: 찾을 동영상 ID. 바이트 단위로 비교한다.
+    // name: 찾을 동영상 이름. 바이트 단위로 비교한다.
     // 반환값: 찾은 항목. 없으면 nullptr. 이 객체가 살아 있는 동안 유효하다.
-    const VideoEntry* Find(std::string_view id) const;
+    const VideoEntry* Find(std::string_view name) const;
 
 
     // 목록 순서대로의 항목을 돌려준다.

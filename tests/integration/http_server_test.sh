@@ -177,11 +177,11 @@ expect_equal "POST /api/sources의 Allow 헤더" "GET" \
         tr -d '\r' | grep -i '^Allow:' | cut -d ' ' -f 2-)"
 expect_equal "이전 목록 경로 /api/videos는 404" "404" "$(status_of /api/videos)"
 expect_equal "목록에 없는 소스 offer" "404" \
-    "$(status_of '/offer?type=file&id=missing.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
-expect_equal "잘못된 id 인코딩 offer" "400" \
-    "$(status_of '/offer?type=file&id=%zz' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+    "$(status_of '/offer?type=file&name=missing.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "잘못된 name 인코딩 offer" "400" \
+    "$(status_of '/offer?type=file&name=%zz' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 expect_equal "type 없는 offer" "400" \
-    "$(status_of '/offer?id=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+    "$(status_of '/offer?name=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 
 # 요청을 끝내지 않은 연결이 있어도 다른 요청은 바로 처리되어야 한다.
 # nc만 백그라운드 작업으로 두어야 nc를 종료한 뒤 남은 sleep을 기다리지 않는다.
@@ -247,10 +247,10 @@ for _ in $(seq 50); do
     sleep 0.1
 done
 expect_equal "디렉터리의 소스 목록" \
-    '{"sources":[{"type":"file","id":"a.h264","frames":1},{"type":"file","id":"b.h264","frames":1}]}' \
+    '{"sources":[{"type":"file","name":"a.h264","frames":1},{"type":"file","name":"b.h264","frames":1}]}' \
     "$(curl -s "${base_url}/api/sources")"
 expect_equal "목록에 있는 소스 offer" "200" \
-    "$(status_of '/offer?type=file&id=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+    "$(status_of '/offer?type=file&name=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 expect_equal "잘못된 파일 건너뜀 경고" "1" "$(grep -c '^경고: .*bad\.h264' "${server_log}")"
 kill -TERM "${server_pid}"
 wait "${server_pid}"

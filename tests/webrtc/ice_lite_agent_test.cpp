@@ -175,7 +175,7 @@ std::expected<IceSessionParameters, std::string> CreateTestSession(IceLiteAgent&
                                                  .remote_fingerprint = remote_fingerprint,
                                                  .h264_payload_type = kTestPayloadType,
                                                  .video = video,
-                                                 .video_id = "test.h264"});
+                                                 .video_name = "test.h264"});
 }
 
 
