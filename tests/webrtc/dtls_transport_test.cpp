@@ -208,6 +208,48 @@ void TestClosesOnCloseNotify(const DtlsContext& context) {
 }
 
 
+// 연결된 상태에서 Close()하면 클라이언트가 close_notify를 받고, 핸드셰이크 중에는 아무것도 하지 않는지 검사한다.
+void TestServerClose(const DtlsContext& context) {
+    auto client = DtlsTestClient::Create(true);
+    auto server = client ? DtlsTransport::Create(context, client->Sha256Fingerprint())
+                         : std::unexpected(client.error());
+    if (!server) {
+        Expect(false, "클라이언트와 서버 준비: " + server.error());
+        return;
+    }
+
+    for (const Datagram& client_hello : client->Advance()) {
+        (*server)->HandleDatagram(client_hello);
+    }
+    Expect((*server)->Close().empty(), "핸드셰이크 중 Close는 빈 목록");
+    Expect((*server)->State() == DtlsState::kHandshaking, "핸드셰이크 중 Close는 상태를 바꾸지 않음");
+
+    auto connected_client = DtlsTestClient::Create(true);
+    auto connected_server = connected_client
+                                ? DtlsTransport::Create(context, connected_client->Sha256Fingerprint())
+                                : std::unexpected(connected_client.error());
+    if (!connected_server) {
+        Expect(false, "두 번째 세션 준비: " + connected_server.error());
+        return;
+    }
+    RunHandshake(**connected_server, *connected_client);
+    if ((*connected_server)->State() != DtlsState::kConnected) {
+        Expect(false, "Close 전 핸드셰이크 완료");
+        return;
+    }
+
+    const std::vector<Datagram> close_notify = (*connected_server)->Close();
+    Expect(!close_notify.empty(), "연결된 상태의 Close는 close_notify를 돌려줌");
+    Expect((*connected_server)->State() == DtlsState::kClosed, "Close 뒤 kClosed");
+    for (const Datagram& datagram : close_notify) {
+        connected_client->Receive(datagram);
+    }
+    connected_client->Advance();
+    Expect(connected_client->CurrentState() == DtlsTestClient::State::kClosed, "클라이언트가 close_notify를 받음");
+    Expect((*connected_server)->Close().empty(), "닫힌 뒤 Close는 빈 목록");
+}
+
+
 }  // namespace
 
 
@@ -226,5 +268,6 @@ int main() {
     TestRejectsClientWithoutSrtp(*context);
     TestRetransmitsLostFlight(*context);
     TestClosesOnCloseNotify(*context);
+    TestServerClose(*context);
     return vms::test::ExitCode();
 }

@@ -110,18 +110,35 @@ std::string_view DescribeQueryParameterError(http::QueryParameterError error) {
 }
 
 
+// offer 요청이 고른 소스. 파일과 카메라 중 많아야 하나만 값이 있다.
+struct RequestedSource {
+    // 고른 파일 항목. 파일이 아니면 nullptr
+    const media::VideoEntry* file = nullptr;
+
+
+    // 고른 카메라 항목. 카메라가 아니면 nullptr
+    media::CameraEntry* camera = nullptr;
+
+
+    // 로그와 세션에 쓸 "<종류> <이름>" 문자열. 소스가 없으면 비어 있다.
+    std::string label;
+};
+
+
 // offer 요청의 type·name 쿼리 매개변수로 세션에 보낼 소스를 찾는다.
 //
 // target: 요청 대상 원문
 // video_library: 파일 소스를 찾을 동영상 목록
-// 반환값: 찾은 파일 항목. type·name이 모두 없으면 nullptr. 해석할 수 없으면 400, 목록에 없으면 404
+// camera_list: 카메라 소스를 찾을 카메라 목록
+// 반환값: 찾은 소스. type·name이 모두 없으면 빈 소스. 해석할 수 없으면 400, 그 종류의 목록에 없으면 404
 //   (원인을 로그에 남김)
 //
-// 해석 오류(인코딩·중복, 한쪽만 옴, 알 수 없는 종류)를 존재 여부보다 먼저 판정한다. 카메라 목록은 아직 없으므로
-// type=camera는 항상 404다. 디코딩한 name은 목록의 이름과 비교만 하고 파일 경로로 쓰지 않으므로, "../" 같은 값도
-// 목록에 없어 404가 된다.
-std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
-    std::string_view target, const media::VideoLibrary& video_library) {
+// 해석 오류(인코딩·중복, 한쪽만 옴, 알 수 없는 종류)를 존재 여부보다 먼저 판정한다. 파일과 카메라는 이름이 겹칠 수
+// 있으므로 type으로 고른 목록에서만 찾는다. 디코딩한 name은 목록의 이름과 비교만 하고 파일 경로로 쓰지 않으므로,
+// "../" 같은 값도 목록에 없어 404가 된다.
+std::expected<RequestedSource, http::HttpStatus> FindRequestedSource(std::string_view target,
+                                                                     const media::VideoLibrary& video_library,
+                                                                     const media::CameraList& camera_list) {
     const auto type = http::FindQueryParameter(target, "type");
     const auto name = http::FindQueryParameter(target, "name");
     if (!type || !name) {
@@ -130,7 +147,7 @@ std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
         return std::unexpected(http::HttpStatus::kBadRequest);
     }
     if (!*type && !*name) {
-        return nullptr;
+        return RequestedSource{};
     }
     if (!*type || !*name) {
         std::println(stderr, "offer 거부: type·name 중 하나만 옴 ({})", target);
@@ -143,13 +160,19 @@ std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
         return std::unexpected(http::HttpStatus::kBadRequest);
     }
 
-    const media::VideoEntry* const entry =
-        *source_type == SourceType::kFile ? video_library.Find(**name) : nullptr;
-    if (entry == nullptr) {
+    RequestedSource source;
+    if (*source_type == SourceType::kFile) {
+        source.file = video_library.Find(**name);
+        source.label = "file " + **name;
+    } else {
+        source.camera = camera_list.Find(**name);
+        source.label = "camera " + **name;
+    }
+    if (source.file == nullptr && source.camera == nullptr) {
         std::println(stderr, "offer 거부: 목록에 없는 소스 ({})", target);
         return std::unexpected(http::HttpStatus::kNotFound);
     }
-    return entry;
+    return source;
 }
 
 
@@ -157,8 +180,8 @@ std::expected<const media::VideoEntry*, http::HttpStatus> FindRequestedSource(
 
 
 Signaling::Signaling(IceLiteAgent& agent, const crypto::Certificate& certificate,
-                     const media::VideoLibrary& video_library)
-    : agent_(agent), certificate_(certificate), video_library_(video_library) {}
+                     const media::VideoLibrary& video_library, const media::CameraList& camera_list)
+    : agent_(agent), certificate_(certificate), video_library_(video_library), camera_list_(camera_list) {}
 
 
 http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& request,
@@ -170,9 +193,9 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     }
 
     // 소스 확인은 SDP 해석보다 가벼우므로 먼저 한다.
-    const auto video = FindRequestedSource(request.target, video_library_);
-    if (!video) {
-        return http::HttpEndpointResponse::Error(video.error());
+    const auto source = FindRequestedSource(request.target, video_library_, camera_list_);
+    if (!source) {
+        return http::HttpEndpointResponse::Error(source.error());
     }
 
     const auto description = ParseSdp(body);
@@ -196,8 +219,9 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     auto session = cname ? agent_.CreateSession(IceSessionRequest{.remote_ufrag = offer->ice_ufrag,
                                                                   .remote_fingerprint = offer->remote_fingerprint,
                                                                   .h264_payload_type = *payload_type,
-                                                                  .video = *video ? &(*video)->file : nullptr,
-                                                                  .video_name = *video ? (*video)->name : ""})
+                                                                  .video = source->file != nullptr ? &source->file->file : nullptr,
+                                                                  .camera = source->camera != nullptr ? &source->camera->source : nullptr,
+                                                                  .source_label = source->label})
                          : std::expected<IceSessionParameters, std::string>(std::unexpected(cname.error()));
     if (!session) {
         std::println(stderr, "ICE 세션 생성 실패: {}", session.error());
@@ -215,9 +239,9 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     parameters.media_stream_id = kMediaStreamId;
     parameters.track_id = kVideoTrackId;
 
-    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}, 동영상 {}",
+    std::println(stderr, "ICE 세션 생성: 세션 {}, 브라우저 ufrag {}, H.264 payload {}, SSRC {}, 소스 {}",
                  session->ice_ufrag, offer->ice_ufrag, *payload_type, session->ssrc,
-                 *video ? std::string_view((*video)->name) : "없음");
+                 source->label.empty() ? std::string_view("없음") : std::string_view(source->label));
     return http::HttpEndpointResponse{.status = http::HttpStatus::kOk,
                                       .content_type = "application/sdp",
                                       .body = BuildSdpAnswer(*offer, parameters)};
@@ -226,13 +250,25 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
 
 http::HttpEndpointResponse Signaling::HandleSourceList() const {
     std::string body = R"({"sources":[)";
-    for (const media::VideoEntry& entry : video_library_.Entries()) {
-        if (&entry != &video_library_.Entries().front()) {
+    bool is_first = true;
+    const auto append_separator = [&] {
+        if (!is_first) {
             body.push_back(',');
         }
+        is_first = false;
+    };
+    for (const media::VideoEntry& entry : video_library_.Entries()) {
+        append_separator();
         body.append(R"({"type":"file","name":)");
         core::AppendJsonString(body, entry.name);
         std::format_to(std::back_inserter(body), R"(,"frames":{}}})", entry.file.Frames().size());
+    }
+    // 카메라는 연결 상태와 관계없이 등록한 순서대로 모두 넣는다.
+    for (const std::unique_ptr<media::CameraEntry>& entry : camera_list_.Entries()) {
+        append_separator();
+        body.append(R"({"type":"camera","name":)");
+        core::AppendJsonString(body, entry->name);
+        body.push_back('}');
     }
     body.append("]}");
     return http::HttpEndpointResponse{

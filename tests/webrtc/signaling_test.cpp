@@ -12,6 +12,7 @@
 #include "core/network_interfaces.h"
 #include "crypto/certificate.h"
 #include "crypto/dtls_context.h"
+#include "media/camera_list.h"
 #include "media/video_library.h"
 #include "test_support.h"
 #include "webrtc/dtls_transport.h"
@@ -22,6 +23,7 @@ using vms::crypto::Certificate;
 using vms::crypto::DtlsContext;
 using vms::http::HttpRequest;
 using vms::http::HttpStatus;
+using vms::media::CameraList;
 using vms::media::VideoLibrary;
 using vms::test::Expect;
 using vms::webrtc::DtlsTransport;
@@ -82,7 +84,7 @@ HttpStatus PostOffer(Signaling& signaling, std::string_view target, std::string_
 
 // type·name 매개변수에 따라 offer를 받아들이거나 거부하는지 검사한다.
 //
-// signaling: 동영상 세 개(a.h264, b.h264, kKoreanVideoId)가 있는 엔드포인트
+// signaling: 동영상 세 개(a.h264, b.h264, kKoreanVideoId)와 카메라 두 대(front, a.h264)가 있는 엔드포인트
 // offer: Chrome offer 견본
 void TestOfferSourceParameter(Signaling& signaling, std::string_view offer) {
     Expect(PostOffer(signaling, "/offer?type=file&name=a.h264", offer) == HttpStatus::kOk, "목록에 있는 파일은 200");
@@ -99,8 +101,15 @@ void TestOfferSourceParameter(Signaling& signaling, std::string_view offer) {
            "경로처럼 보이는 이름은 404");
     Expect(PostOffer(signaling, "/offer?type=file&name=A.h264", offer) == HttpStatus::kNotFound,
            "대소문자가 다르면 404");
-    Expect(PostOffer(signaling, "/offer?type=camera&name=a.h264", offer) == HttpStatus::kNotFound,
-           "종류가 다른 소스는 404");
+    Expect(PostOffer(signaling, "/offer?type=camera&name=b.h264", offer) == HttpStatus::kNotFound,
+           "파일 이름을 type=camera로 보내면 404");
+    Expect(PostOffer(signaling, "/offer?type=file&name=front", offer) == HttpStatus::kNotFound,
+           "카메라 이름을 type=file로 보내면 404");
+    Expect(PostOffer(signaling, "/offer?type=camera&name=front", offer) == HttpStatus::kOk, "목록에 있는 카메라는 200");
+    Expect(PostOffer(signaling, "/offer?type=camera&name=a.h264", offer) == HttpStatus::kOk,
+           "파일과 같은 이름의 카메라도 종류로 구분해 200");
+    Expect(PostOffer(signaling, "/offer?type=camera&name=missing", offer) == HttpStatus::kNotFound,
+           "목록에 없는 카메라는 404");
 
     Expect(PostOffer(signaling, "/offer?type=disk&name=a.h264", offer) == HttpStatus::kBadRequest,
            "알 수 없는 종류는 400");
@@ -126,7 +135,7 @@ void TestOfferSourceParameter(Signaling& signaling, std::string_view offer) {
 
 // 소스 목록 JSON의 순서, 종류, 프레임 수, 이스케이프를 검사한다.
 //
-// signaling: 동영상 세 개가 있는 엔드포인트
+// signaling: 동영상 세 개와 카메라 두 대가 있는 엔드포인트
 void TestSourceList(const Signaling& signaling) {
     const auto response = signaling.HandleSourceList();
     Expect(response.status == HttpStatus::kOk, "목록 200");
@@ -134,9 +143,11 @@ void TestSourceList(const Signaling& signaling) {
     Expect(response.body == "{\"sources\":["
                             "{\"type\":\"file\",\"name\":\"a.h264\",\"frames\":2},"
                             "{\"type\":\"file\",\"name\":\"b.h264\",\"frames\":1},"
-                            "{\"type\":\"file\",\"name\":\"\xEC\x8B\x9C\xED\x97\x98 \\\"1\\\".h264\",\"frames\":1}"
+                            "{\"type\":\"file\",\"name\":\"\xEC\x8B\x9C\xED\x97\x98 \\\"1\\\".h264\",\"frames\":1},"
+                            "{\"type\":\"camera\",\"name\":\"front\"},"
+                            "{\"type\":\"camera\",\"name\":\"a.h264\"}"
                             "]}",
-           "이름의 바이트 순서, 종류, 프레임 수, 큰따옴표 이스케이프");
+           "파일은 이름의 바이트 순서로 먼저, 카메라는 등록 순서로 뒤에 두고 카메라 원소에는 frames가 없음");
 }
 
 
@@ -171,6 +182,11 @@ int main() {
         return vms::test::ExitCode();
     }
 
+    // 세션이 카메라 소스를 참조하므로 에이전트보다 먼저 만든다.
+    CameraList cameras;
+    cameras.Add("front", "rtsp://127.0.0.1:8554/cam");
+    cameras.Add("a.h264", "rtsp://127.0.0.1:9554/cam");
+
     const in_addr loopback = *vms::core::ParseIpv4Address("127.0.0.1");
     auto agent = IceLiteAgent::Start(*loop, IceLiteAgentConfig{.addresses = {loopback}, .port = 0}, *dtls_context);
     if (!agent) {
@@ -178,12 +194,13 @@ int main() {
         return vms::test::ExitCode();
     }
 
-    Signaling signaling(**agent, *certificate, loaded->library);
+    Signaling signaling(**agent, *certificate, loaded->library, cameras);
     TestOfferSourceParameter(signaling, offer);
     TestSourceList(signaling);
 
     const VideoLibrary empty_library;
-    Signaling empty_signaling(**agent, *certificate, empty_library);
+    const CameraList empty_cameras;
+    Signaling empty_signaling(**agent, *certificate, empty_library, empty_cameras);
     Expect(empty_signaling.HandleSourceList().body == "{\"sources\":[]}", "소스 없이 실행하면 빈 배열");
     Expect(PostOffer(empty_signaling, "/offer", offer) == HttpStatus::kOk, "빈 목록에서도 type·name 없는 offer는 200");
 

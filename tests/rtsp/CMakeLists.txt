@@ -1,0 +1,4 @@
+add_unit_test(rtsp_url_test)
+add_unit_test(rtsp_message_test)
+add_unit_test(h264_rtp_depacketizer_test)
+add_unit_test(rtsp_camera_client_test)

@@ -5,6 +5,8 @@
 현재는 웹 페이지를 제공하는 HTTP 서버, 브라우저와 ICE 연결을 맺는 시그널링·ICE-lite, 그 연결 위에서
 SRTP 키를 정하는 DTLS 핸드셰이크, 그리고 서버의 H.264 파일을 RTP로 패킷화해 SRTP로 보내는 송신까지 구현되어 있습니다.
 브라우저 페이지에서 `--video-dir`로 지정한 디렉터리의 동영상을 골라 연결하면 그 영상이 반복 재생됩니다.
+`--camera`로 등록한 RTSP 카메라(예: vms-cam 저장소의 `vms_camera_server`)를 고르면 카메라의 실시간 영상이
+트랜스코딩 없이 재생됩니다.
 
 ## 필요한 도구
 
@@ -56,6 +58,7 @@ http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 | `--ice-address` | 자동 조회 | candidate로 알리고 UDP 소켓을 바인드할 IPv4 주소. 여러 번 쓸 수 있으며, 쓴 순서대로 우선순위가 높습니다 |
 | `--video-dir` | 없음 | 재생할 H.264 Annex-B 파일(`.h264`, `.264`)이 든 디렉터리. 없으면 연결 확인까지만 하고 영상은 보내지 않습니다 |
 | `--video-fps` | 30 | 영상 재생 속도(1~120). 디렉터리의 모든 파일에 적용하므로 파일을 만들 때의 프레임 속도와 같게 지정합니다 |
+| `--camera` | 없음 | `<이름>=rtsp://<호스트>[:<포트>][/<경로>]` 형식으로 RTSP 카메라를 등록합니다. 여러 번 쓸 수 있으며 쓴 순서가 목록 순서입니다. 아래 "카메라 연결" 참고 |
 
 `--ice-address`를 주지 않으면 켜져 있고 루프백이 아닌 인터페이스의 IPv4 주소를 모두 씁니다.
 이 머신에 없는 주소(예: 공유기의 공인 IP)는 바인드할 수 없으므로 지금은 같은 PC나 같은 내부 네트워크의
@@ -117,26 +120,73 @@ ffmpeg -f lavfi -i smptebars=size=1280x720:rate=30 -t 10 -c:v libx264 -profile:v
 - fps는 모든 파일에 같은 값을 쓰므로, 같은 fps로 만든 파일만 디렉터리에 둡니다. 다르면 빠르거나 느리게 재생됩니다.
 - 디렉터리는 시작할 때 한 번만 읽습니다. 파일을 추가하거나 지웠으면 서버를 다시 시작합니다.
 
+### 카메라 연결
+
+카메라 서버 `vms_camera_server`(`~/vms-cam`)를 카메라 없이 테스트 패턴으로 띄웁니다. 빌드 방법은 vms-cam의 README를 봅니다.
+
+```bash
+~/vms-cam/build/vms_camera_server --test-source
+```
+
+다른 터미널에서 그 RTSP 주소를 카메라 이름 `cam`으로 등록해 서버를 실행합니다.
+
+```bash
+./build/vms_web_server --camera cam=rtsp://127.0.0.1:8554/cam
+```
+
+시작 로그에 등록한 카메라가 나오고, 연결되면 해상도와 payload type이 남습니다.
+
+```text
+카메라 등록: cam, rtsp://127.0.0.1:8554/cam (주소 127.0.0.1:8554)
+카메라 목록: 1대
+...
+카메라 연결 시도: cam, rtsp://127.0.0.1:8554/cam (127.0.0.1:8554)
+카메라 연결 성공: cam, 해상도 640x480, payload type 96, 세션 timeout 60초
+```
+
+웹 페이지의 **소스** 목록에서 "카메라 · cam"을 골라 연결하면 카메라 영상이 표시됩니다. 파일과 카메라를 함께 쓸 수도 있습니다.
+
+```bash
+./build/vms_web_server --video-dir videos --camera cam=rtsp://127.0.0.1:8554/cam
+```
+
+- `--camera` 값은 첫 `=`에서 이름과 URL로 나눕니다. `=`가 없거나, 이름이 비었거나, 카메라끼리 이름이 겹치거나, URL에
+  사용자 정보(`user:pass@`, 인증 미지원)가 있거나, 호스트를 IPv4 주소로 해석할 수 없으면 원인을 출력하고 시작하지 않습니다.
+  호스트 이름은 시작할 때 한 번만 해석합니다. 카메라 이름은 파일 동영상 이름과 겹쳐도 됩니다(종류로 구분).
+- 서버는 등록한 카메라마다 RTSP 연결 하나를 상시 유지하고, 같은 카메라를 보는 모든 탭이 그 연결을 함께 씁니다.
+  제어는 TCP, 영상(RTP)은 UDP로 받습니다. TCP interleaved, 인증, RTSPS는 지원하지 않습니다.
+- 시작할 때 카메라가 꺼져 있어도 서버는 시작합니다. 제어 연결이 닫히거나, 요청에 5초 동안 응답이 없거나, 3초 동안
+  RTP가 오지 않으면 끊긴 것으로 보고(`카메라 끊김: ...`) 1, 2, 4, 8, 10, 10, ...초 간격으로 다시 연결합니다.
+  연결에 성공하면 간격은 다시 1초부터 셉니다.
+- 브라우저는 연결 뒤 카메라의 다음 키프레임(vms-cam 기본 1초 간격)부터 받으므로 첫 화면이 최대 1초 늦게 뜹니다.
+  패킷이 빠지면 다음 키프레임까지 화면이 멈췄다가 이어집니다.
+- 카메라가 끊겨도 브라우저 연결은 유지한 채 기다립니다(`카메라 대기 시작: ...`). 30초 안에 카메라가 다시 연결되면
+  같은 탭에서 다음 키프레임부터 영상이 이어집니다(`카메라 대기 끝: ...`). 30초가 지나면 서버가 DTLS close_notify를 보내고
+  세션을 제거하므로(`카메라 대기 시간 초과: ...`), 페이지의 연결 상태가 `connected`가 아닌 값으로 바뀝니다.
+- `Ctrl+C`로 서버를 끝내면 연결된 카메라에 `TEARDOWN`을 보내고 종료합니다.
+
 ### 소스 목록과 선택 API
 
 웹 페이지는 `GET /api/sources`로 소스 목록을 받고, 고른 소스의 종류(`type`)와 이름(`name`)을 `POST /offer`의
-쿼리 매개변수로 보냅니다. `type`은 `file`(동영상 파일) 또는 `camera`(카메라)이며, 지금은 `file`만 목록에 나옵니다.
-`frames`(프레임 수)는 `file` 원소에만 있습니다.
+쿼리 매개변수로 보냅니다. `type`은 `file`(동영상 파일) 또는 `camera`(카메라)입니다. 목록에는 `file` 원소를
+이름순으로 먼저, `camera` 원소를 `--camera`로 등록한 순서대로 그 뒤에 둡니다. 카메라는 연결 상태와 관계없이 항상
+목록에 있습니다. `frames`(프레임 수)는 `file` 원소에만 있습니다.
 
 ```bash
 curl -s http://localhost:8080/api/sources
 ```
 
 ```json
-{"sources":[{"type":"file","name":"color_bars.h264","frames":300},{"type":"file","name":"test_pattern.h264","frames":300}]}
+{"sources":[{"type":"file","name":"color_bars.h264","frames":300},{"type":"file","name":"test_pattern.h264","frames":300},{"type":"camera","name":"cam"}]}
 ```
 
 | `POST /offer` 요청 대상 | 결과 |
 |---|---|
-| `/offer?type=file&name=color_bars.h264` | 그 파일을 보내는 세션 |
+| `/offer?type=file&name=color_bars.h264` | 그 파일을 첫 프레임부터 보내는 세션 |
+| `/offer?type=camera&name=cam` | 그 카메라의 영상을 다음 키프레임부터 보내는 세션 |
 | `/offer` | 영상 없는 세션. 이전 형식의 `video` 매개변수도 무시하므로 같은 결과입니다 |
 | `type`·`name` 중 하나만 있음, 같은 매개변수가 두 번 옴, 퍼센트 인코딩 오류, `type`이 `file`·`camera`가 아님 | `400` |
-| 종류와 이름이 맞는 소스가 없음(`type=camera`는 아직 항상 해당) | `404` |
+| 종류와 이름이 맞는 소스가 없음 | `404` |
 
 이름에 한글이나 `&` 같은 문자가 있으면 값을 퍼센트 인코딩합니다(브라우저의 `encodeURIComponent`).
 
@@ -155,8 +205,8 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
 
 1. 서버를 실행하고 Windows Chrome에서 `http://localhost:8080/`에 접속합니다.
    "app.js가 실행되었습니다." 문구가 보이면 페이지와 스크립트가 정상적으로 전달된 것입니다.
-   **소스** 선택 목록에는 서버의 동영상이 "파일 · <이름>" 형식으로 이름순으로 나오고 첫 항목이 선택되어 있습니다.
-   `--video-dir` 없이 실행했으면 "소스 없음"이 표시되며, 연결은 영상 없이 맺어집니다.
+   **소스** 선택 목록에는 서버의 동영상이 "파일 · <이름>" 형식으로 이름순으로, 그 뒤에 카메라가 "카메라 · <이름>" 형식으로
+   나오고 첫 항목이 선택되어 있습니다. `--video-dir`과 `--camera` 없이 실행했으면 "소스 없음"이 표시되며, 연결은 영상 없이 맺어집니다.
 2. 소스를 고르고 **연결** 버튼을 누르면 시그널링이 "answer 적용 완료"가 되고, ICE 상태가 `checking`을 거쳐 `connected`가 됩니다.
    서버 로그에는 `ICE 연결됨: ...`이 남습니다.
 3. 이어서 DTLS 핸드셰이크가 끝나면 연결 상태(`connectionState`)가 `connected`가 되고,
@@ -171,13 +221,13 @@ NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, �
    | `srtpCipher` | `SRTP_AES128_CM_HMAC_SHA1_80` | 협상한 SRTP 프로파일 |
 
 5. 소스를 골랐다면 페이지의 영상 영역에 그 동영상이 표시되고, 파일 끝에서 처음부터 반복됩니다.
-   서버 로그에는 `송신 시작: 세션 ..., 동영상 <이름>, SSRC ..., payload type ...`이 남습니다.
+   서버 로그에는 `송신 시작: 세션 ..., 소스 file <이름>, SSRC ..., payload type ...`이 남습니다(카메라는 `소스 camera <이름>`).
    다른 소스를 보려면 목록에서 고른 뒤 **연결** 버튼을 다시 누릅니다. 새 연결을 맺어 처음부터 재생합니다.
    `chrome://webrtc-internals`의 inbound-rtp(video) 통계에서 다음을 확인합니다.
 
    | 항목 | 기대값 | 의미 |
    |---|---|---|
-   | `framesPerSecond` | 약 30 | `--video-fps`대로 프레임이 도착해 디코딩됨 |
+   | `framesPerSecond` | 약 30 | 파일은 `--video-fps`대로, 카메라는 카메라의 fps대로 프레임이 도착해 디코딩됨 |
    | `packetsReceived` | 계속 증가 | SRTP 인증을 통과한 패킷 수 |
    | `framesDecoded` | 계속 증가 | 디코딩한 프레임 수 |
    | `packetsLost` | 0 근처 | 순번이 빠진 패킷 수 |
@@ -212,7 +262,7 @@ ICE 세션은 만든 뒤, 또는 마지막 유효 Binding 요청 뒤 30초 동�
 ctest --test-dir build --output-on-failure
 ```
 
-`tests/`는 `src/`와 같은 디렉터리 구조를 따르며, 모듈별 단위 테스트(`tests/core/`, `tests/crypto/`, `tests/http/`, `tests/media/`, `tests/webrtc/`)와
+`tests/`는 `src/`와 같은 디렉터리 구조를 따르며, 모듈별 단위 테스트(`tests/core/`, `tests/crypto/`, `tests/http/`, `tests/media/`, `tests/rtsp/`, `tests/webrtc/`)와
 서버를 실제로 띄워 요청을 보내는 통합 테스트(`tests/integration/`)가 함께 실행됩니다.
 `tests/webrtc/data/chrome_offer.sdp`는 실제 Chrome이 만든 offer 견본입니다.
 

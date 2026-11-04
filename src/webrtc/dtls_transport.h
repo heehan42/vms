@@ -35,7 +35,7 @@ enum class DtlsState {
     // fingerprint 불일치, SRTP 미협상, 치명적 경고, 프로토콜 오류 등으로 실패. 이후 입력은 버린다.
     kFailed,
 
-    // 브라우저의 close_notify를 받아 닫힘. 이후 입력은 버린다.
+    // 브라우저의 close_notify를 받았거나 서버가 Close()로 닫음. 이후 입력은 버린다.
     kClosed,
 };
 
@@ -123,6 +123,15 @@ public:
     // 반환값: 밀리초로 올림한 남은 시간(이미 지났으면 0). 재전송을 기다리는 메시지가 없거나 상태가
     //   kFailed, kClosed이면 빈 optional
     std::optional<std::chrono::milliseconds> NextTimeout() const;
+
+
+    // 서버 쪽에서 연결을 닫고 브라우저에 보낼 close_notify를 만든다.
+    //
+    // 반환값: close_notify 경고를 담은 데이터그램 목록. kConnected가 아니면 빈 목록
+    //
+    // kConnected일 때만 close_notify를 쓰고 kClosed로 바꾸며, 브라우저의 close_notify는 기다리지 않는다.
+    // 다른 상태에서는 상태를 바꾸지 않는다. 호출자는 돌려받은 데이터그램을 nominated pair로 보낸다.
+    std::vector<Datagram> Close();
 
 
     // 현재 상태를 돌려준다.

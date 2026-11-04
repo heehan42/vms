@@ -21,6 +21,7 @@
 #include "crypto/dtls_context.h"
 #include "dtls_test_client.h"
 #include "media/h264_file.h"
+#include "media/live_video_source.h"
 #include "rtp_test_support.h"
 #include "srtcp_test_sender.h"
 #include "srtp_test_receiver.h"
@@ -33,6 +34,9 @@ using vms::core::UniqueFd;
 using vms::crypto::Certificate;
 using vms::crypto::DtlsContext;
 using vms::media::H264File;
+using vms::media::LiveVideoEvent;
+using vms::media::LiveVideoFrame;
+using vms::media::LiveVideoSource;
 using vms::test::DtlsTestClient;
 using vms::test::Expect;
 using vms::test::AppendSyntheticNalUnit;
@@ -167,15 +171,18 @@ constexpr std::chrono::milliseconds kVideoSessionTimeout = 500ms;
 // agent: 세션을 만들 에이전트
 // remote_fingerprint: 브라우저 인증서 fingerprint
 // video: 세션에 지정할 동영상. nullptr이면 동영상 없는 세션
+// camera: 세션에 지정할 카메라 소스. nullptr이면 카메라 없는 세션
 // 반환값: CreateSession의 결과
 std::expected<IceSessionParameters, std::string> CreateTestSession(IceLiteAgent& agent,
                                                                    std::string_view remote_fingerprint,
-                                                                   const H264File* video = nullptr) {
+                                                                   const H264File* video = nullptr,
+                                                                   LiveVideoSource* camera = nullptr) {
     return agent.CreateSession(IceSessionRequest{.remote_ufrag = "brow",
                                                  .remote_fingerprint = remote_fingerprint,
                                                  .h264_payload_type = kTestPayloadType,
                                                  .video = video,
-                                                 .video_name = "test.h264"});
+                                                 .camera = camera,
+                                                 .source_label = camera != nullptr ? "camera test" : "file test.h264"});
 }
 
 
@@ -601,13 +608,15 @@ struct MediaReceiver {
 // loop: 에이전트가 등록된 이벤트 루프
 // agent: 세션을 만들 에이전트
 // video: 세션에 지정할 동영상. nullptr이면 동영상 없는 세션
+// camera: 세션에 지정할 카메라 소스. nullptr이면 카메라 없는 세션
 // 반환값: 핸드셰이크를 마친 수신 측. 준비에 실패하면 빈 optional
-std::optional<MediaReceiver> ConnectMediaReceiver(EventLoop& loop, IceLiteAgent& agent, const H264File* video) {
+std::optional<MediaReceiver> ConnectMediaReceiver(EventLoop& loop, IceLiteAgent& agent, const H264File* video,
+                                                  LiveVideoSource* camera = nullptr) {
     auto dtls_client = DtlsTestClient::Create(true);
     if (!dtls_client) {
         return std::nullopt;
     }
-    auto session = CreateTestSession(agent, dtls_client->Sha256Fingerprint(), video);
+    auto session = CreateTestSession(agent, dtls_client->Sha256Fingerprint(), video, camera);
     TestClient client = OpenClient();
     if (!session || !client.socket.IsValid()) {
         return std::nullopt;
@@ -985,6 +994,184 @@ void TestVideoContinuesAfterRtcpFailures(EventLoop& loop, IceLiteAgent& agent, c
 }
 
 
+
+
+// 카메라 세션 시나리오의 짧은 카메라 대기 시간
+constexpr std::chrono::milliseconds kShortCameraWaitTimeout = 300ms;
+
+
+// 카메라 세션 시나리오용 에이전트를 시작한다.
+//
+// loop: 에이전트를 등록할 루프
+// dtls_context: DTLS 컨텍스트
+// 반환값: 카메라 대기 시간이 짧은 에이전트. 시작에 실패하면 nullptr
+//
+// 세션이 카메라 소스를 구독하므로, 소스를 먼저 만들고 에이전트를 나중에 만들어 먼저 소멸하게 한다.
+std::unique_ptr<IceLiteAgent> StartCameraAgent(EventLoop& loop, const DtlsContext& dtls_context) {
+    auto agent = IceLiteAgent::Start(loop,
+                                     IceLiteAgentConfig{.addresses = {*vms::core::ParseIpv4Address("127.0.0.1")},
+                                                        .port = 0,
+                                                        .camera_wait_timeout = kShortCameraWaitTimeout},
+                                     dtls_context);
+    return agent ? *std::move(agent) : nullptr;
+}
+
+
+// 합성 동영상의 프레임을 카메라 프레임처럼 소스에 넣는다.
+//
+// source: 프레임을 넣을 소스
+// video: 합성 동영상. 0번 프레임만 키프레임이다.
+// frame_index: 넣을 프레임 위치
+// camera_timestamp: 카메라 RTP 타임스탬프
+void PublishCameraFrame(LiveVideoSource& source, const H264File& video, std::size_t frame_index,
+                        std::uint32_t camera_timestamp) {
+    source.PublishFrame(LiveVideoFrame{.frame = video.Frames()[frame_index],
+                                       .rtp_timestamp = camera_timestamp,
+                                       .is_keyframe = frame_index == 0});
+}
+
+
+// 수신 측 소켓에 쌓인 SRTP 패킷을 모아 프레임으로 복호화한다.
+//
+// receiver: 수신 측
+// 반환값: 지금까지 받은 프레임. 복호화에 실패하면 빈 optional
+std::optional<std::vector<std::vector<ReceivedRtpPacket>>> CollectFrames(MediaReceiver& receiver) {
+    std::ranges::move(FilterRtpPackets(DrainSocket(receiver.client)), std::back_inserter(receiver.srtp_packets));
+    return DecryptFrames(receiver);
+}
+
+
+// 프레임의 RTP 페이로드를 NAL 목록으로 재조립한다.
+//
+// frame: 프레임 하나의 RTP 패킷
+// 반환값: 재조립한 NAL 목록
+std::optional<std::vector<std::vector<std::uint8_t>>> ReassembleFrame(const std::vector<ReceivedRtpPacket>& frame) {
+    std::vector<std::vector<std::uint8_t>> payloads;
+    for (const ReceivedRtpPacket& packet : frame) {
+        payloads.push_back(packet.payload);
+    }
+    return ReassembleNalUnits(payloads);
+}
+
+
+// DTLS 완료 뒤 키프레임부터 받고, 같은 소스를 두 세션이 함께 받으며, 카메라 타임스탬프 간격이 유지되는지 검사한다.
+void TestStreamsCameraFromKeyframe(EventLoop& loop, const DtlsContext& dtls_context) {
+    const H264File video = MakeSyntheticH264File();
+    LiveVideoSource camera;
+    camera.PublishEvent(LiveVideoEvent::kConnected);
+    auto agent = StartCameraAgent(loop, dtls_context);
+    auto first = agent ? ConnectMediaReceiver(loop, *agent, nullptr, &camera) : std::nullopt;
+    auto second = agent ? ConnectMediaReceiver(loop, *agent, nullptr, &camera) : std::nullopt;
+    if (!first || !second) {
+        Expect(false, "카메라 수신 측 둘 연결");
+        return;
+    }
+    Expect(camera.SubscriberCount() == 2, "DTLS 완료 뒤 두 세션이 소스를 구독");
+
+    PublishCameraFrame(camera, video, 1, 1000);
+    PublishCameraFrame(camera, video, 0, 4000);
+    PublishCameraFrame(camera, video, 1, 7000);
+    PublishCameraFrame(camera, video, 2, 10000);
+    for (MediaReceiver* receiver : {&*first, &*second}) {
+        const auto frames = CollectFrames(*receiver);
+        if (!frames || frames->size() != 3) {
+            Expect(false, "키프레임부터 세 프레임을 받아야 한다");
+            continue;
+        }
+        Expect(ReassembleFrame((*frames)[0]) == TransmittedNalUnits(video.Frames()[0]), "첫 프레임은 키프레임");
+        Expect(ReassembleFrame((*frames)[2]) == TransmittedNalUnits(video.Frames()[2]), "이후 프레임은 도착 순서대로");
+        Expect(static_cast<std::uint32_t>((*frames)[1].front().timestamp - (*frames)[0].front().timestamp) == 3000 &&
+                   static_cast<std::uint32_t>((*frames)[2].front().timestamp - (*frames)[1].front().timestamp) == 3000,
+               "카메라 타임스탬프 간격 유지");
+        Expect((*frames)[0].front().ssrc == receiver->session.ssrc, "SSRC는 세션 값");
+    }
+}
+
+
+// 카메라가 끊겼다가 대기 시간 안에 다시 연결되면 세션이 남고 다음 키프레임부터 이어서 받는지 검사한다.
+void TestCameraReconnectsWithinWait(EventLoop& loop, const DtlsContext& dtls_context) {
+    const H264File video = MakeSyntheticH264File();
+    LiveVideoSource camera;
+    camera.PublishEvent(LiveVideoEvent::kConnected);
+    auto agent = StartCameraAgent(loop, dtls_context);
+    auto receiver = agent ? ConnectMediaReceiver(loop, *agent, nullptr, &camera) : std::nullopt;
+    if (!receiver) {
+        Expect(false, "카메라 수신 측 연결");
+        return;
+    }
+    PublishCameraFrame(camera, video, 0, 3000);
+
+    camera.PublishEvent(LiveVideoEvent::kDisconnected);
+    RunLoopFor(loop, kShortCameraWaitTimeout / 2);
+    camera.PublishEvent(LiveVideoEvent::kConnected);
+    RunLoopFor(loop, kShortCameraWaitTimeout);
+    Expect(agent->FindSessionState(receiver->session.ice_ufrag).has_value(), "대기 시간 안에 연결되면 세션 유지");
+
+    PublishCameraFrame(camera, video, 1, 999);
+    PublishCameraFrame(camera, video, 0, 1000);
+    const auto frames = CollectFrames(*receiver);
+    if (!frames || frames->size() != 2) {
+        Expect(false, "재연결 뒤 키프레임부터 이어서 받아야 한다");
+        return;
+    }
+    Expect(ReassembleFrame((*frames)[1]) == TransmittedNalUnits(video.Frames()[0]), "재연결 뒤 첫 프레임은 키프레임");
+    Expect((*frames)[1].front().sequence_number == static_cast<std::uint16_t>((*frames)[0].back().sequence_number + 1),
+           "순번은 이어짐");
+    const auto skipped = static_cast<std::uint32_t>((*frames)[1].front().timestamp - (*frames)[0].front().timestamp);
+    Expect(skipped >= 90000 * 4 / 10, "타임스탬프는 끊긴 시간만큼 건너뜀");
+}
+
+
+// 카메라가 대기 시간 동안 돌아오지 않으면 close_notify를 보내고 세션을 제거하며 구독을 해지하는지 검사한다.
+void TestCameraWaitTimeout(EventLoop& loop, const DtlsContext& dtls_context) {
+    const H264File video = MakeSyntheticH264File();
+    LiveVideoSource camera;
+    camera.PublishEvent(LiveVideoEvent::kConnected);
+    auto agent = StartCameraAgent(loop, dtls_context);
+    auto receiver = agent ? ConnectMediaReceiver(loop, *agent, nullptr, &camera) : std::nullopt;
+    if (!receiver) {
+        Expect(false, "카메라 수신 측 연결");
+        return;
+    }
+    PublishCameraFrame(camera, video, 0, 3000);
+    DrainSocket(receiver->client);
+
+    camera.PublishEvent(LiveVideoEvent::kDisconnected);
+    RunLoopFor(loop, kShortCameraWaitTimeout + 100ms);
+    Expect(!agent->FindSessionState(receiver->session.ice_ufrag), "대기 시간이 지나면 세션 제거");
+    Expect(camera.SubscriberCount() == 0, "세션 제거 뒤 구독 해지");
+
+    for (const auto& datagram : DrainSocket(receiver->client)) {
+        if (!IsRtpPacket(datagram)) {
+            receiver->dtls_client.Receive(datagram);
+        }
+    }
+    receiver->dtls_client.Advance();
+    Expect(receiver->dtls_client.CurrentState() == DtlsTestClient::State::kClosed, "브라우저가 close_notify를 받음");
+
+    camera.PublishEvent(LiveVideoEvent::kConnected);
+    PublishCameraFrame(camera, video, 0, 6000);
+    Expect(FilterRtpPackets(DrainSocket(receiver->client)).empty(), "제거된 세션에는 보내지 않음");
+}
+
+
+// 끊긴 카메라로 DTLS가 완료되면 대기를 시작해, 연결되지 않으면 세션을 제거하는지 검사한다.
+void TestCameraDisconnectedAtHandshake(EventLoop& loop, const DtlsContext& dtls_context) {
+    LiveVideoSource camera;
+    auto agent = StartCameraAgent(loop, dtls_context);
+    auto receiver = agent ? ConnectMediaReceiver(loop, *agent, nullptr, &camera) : std::nullopt;
+    if (!receiver) {
+        Expect(false, "카메라 수신 측 연결");
+        return;
+    }
+    Expect(agent->FindSessionState(receiver->session.ice_ufrag).has_value() && camera.SubscriberCount() == 1,
+           "끊긴 카메라여도 DTLS 완료 뒤 세션은 유지하고 구독");
+    RunLoopFor(loop, kShortCameraWaitTimeout + 100ms);
+    Expect(!agent->FindSessionState(receiver->session.ice_ufrag), "카메라가 오지 않으면 대기 시간 뒤 세션 제거");
+    Expect(camera.SubscriberCount() == 0, "세션 제거 뒤 구독 해지");
+}
+
+
 }  // namespace
 
 
@@ -1058,6 +1245,11 @@ int main() {
         return vms::test::ExitCode();
     }
     TestStopsWhenSessionExpires(*loop, **short_timeout_video_agent, video);
+
+    TestStreamsCameraFromKeyframe(*loop, *dtls_context);
+    TestCameraReconnectsWithinWait(*loop, *dtls_context);
+    TestCameraWaitTimeout(*loop, *dtls_context);
+    TestCameraDisconnectedAtHandshake(*loop, *dtls_context);
 
     // 에이전트는 루프, DTLS 컨텍스트, 동영상보다 먼저 소멸해야 한다.
     short_timeout_video_agent->reset();

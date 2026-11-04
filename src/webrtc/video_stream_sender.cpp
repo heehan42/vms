@@ -1,11 +1,6 @@
 #include "webrtc/video_stream_sender.h"
 
-#include <array>
 #include <utility>
-
-#include "crypto/random.h"
-#include "webrtc/h264_packetizer.h"
-#include "webrtc/rtp_packet.h"
 
 
 namespace vms::webrtc {
@@ -22,18 +17,6 @@ constexpr std::uint64_t kVideoClockRate = 90000;
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000;
 
 
-// 순번과 타임스탬프 초기값으로 쓸 난수를 만든다.
-//
-// 반환값: 6바이트 난수(앞 2바이트 순번, 뒤 4바이트 타임스탬프). 난수 생성이 실패하면 오류 메시지
-std::expected<std::array<std::uint8_t, 6>, std::string> GenerateInitialRtpValues() {
-    std::array<std::uint8_t, 6> bytes{};
-    if (auto filled = crypto::FillRandomBytes(bytes); !filled) {
-        return std::unexpected(filled.error());
-    }
-    return bytes;
-}
-
-
 }  // namespace
 
 
@@ -42,39 +25,37 @@ std::expected<std::unique_ptr<VideoStreamSender>, std::string> VideoStreamSender
     std::span<const std::uint8_t, crypto::kSrtpMasterKeySize> master_key,
     std::span<const std::uint8_t, crypto::kSrtpMasterSaltSize> master_salt,
     std::chrono::steady_clock::time_point start_time) {
-    auto srtp_sender = crypto::SrtpSender::Create(master_key, master_salt);
-    if (!srtp_sender) {
-        return std::unexpected(srtp_sender.error());
+    auto packet_writer = SrtpVideoPacketWriter::Create(
+        SrtpVideoPacketWriterConfig{.ssrc = config.ssrc,
+                                    .payload_type = config.payload_type,
+                                    .initial_sequence_number = config.initial_sequence_number},
+        master_key, master_salt);
+    if (!packet_writer) {
+        return std::unexpected(packet_writer.error());
     }
 
-    // 초기값을 무작위로 정해 RTP 패킷만 보고 송신 시작 시점을 추측하기 어렵게 한다(RFC 3550).
-    const auto random_values = GenerateInitialRtpValues();
-    if (!random_values) {
-        return std::unexpected(random_values.error());
+    std::uint32_t initial_timestamp = 0;
+    if (config.initial_timestamp) {
+        initial_timestamp = *config.initial_timestamp;
+    } else {
+        const auto random_timestamp = GenerateInitialRtpTimestamp();
+        if (!random_timestamp) {
+            return std::unexpected(random_timestamp.error());
+        }
+        initial_timestamp = *random_timestamp;
     }
-    const std::array<std::uint8_t, 6>& bytes = *random_values;
-    const std::uint16_t initial_sequence_number = config.initial_sequence_number.value_or(
-        static_cast<std::uint16_t>((bytes[0] << 8) | bytes[1]));
-    const std::uint32_t initial_timestamp = config.initial_timestamp.value_or(
-        (static_cast<std::uint32_t>(bytes[2]) << 24) | (static_cast<std::uint32_t>(bytes[3]) << 16) |
-        (static_cast<std::uint32_t>(bytes[4]) << 8) | bytes[5]);
 
-    return std::unique_ptr<VideoStreamSender>(new VideoStreamSender(video_file, config, *std::move(srtp_sender),
-                                                                    initial_sequence_number, initial_timestamp,
-                                                                    start_time));
+    return std::unique_ptr<VideoStreamSender>(new VideoStreamSender(
+        video_file, config.frames_per_second, *std::move(packet_writer), initial_timestamp, start_time));
 }
 
 
-VideoStreamSender::VideoStreamSender(const media::H264File& video_file, const VideoStreamSenderConfig& config,
-                                     std::unique_ptr<crypto::SrtpSender> srtp_sender,
-                                     std::uint16_t initial_sequence_number, std::uint32_t initial_timestamp,
+VideoStreamSender::VideoStreamSender(const media::H264File& video_file, int frames_per_second,
+                                     SrtpVideoPacketWriter packet_writer, std::uint32_t initial_timestamp,
                                      std::chrono::steady_clock::time_point start_time)
     : video_file_(video_file),
-      frames_per_second_(config.frames_per_second),
-      ssrc_(config.ssrc),
-      payload_type_(config.payload_type),
-      srtp_sender_(std::move(srtp_sender)),
-      next_sequence_number_(initial_sequence_number),
+      frames_per_second_(frames_per_second),
+      packet_writer_(std::move(packet_writer)),
       initial_timestamp_(initial_timestamp),
       schedule_origin_(start_time) {}
 
@@ -106,28 +87,13 @@ std::expected<VideoFrameTransmission, std::string> VideoStreamSender::SendDueFra
     const media::H264Frame& frame = frames[sent_frame_count_ % frames.size()];
     const auto timestamp =
         static_cast<std::uint32_t>(initial_timestamp_ + sent_frame_count_ * kVideoClockRate / frames_per_second_);
-    const std::vector<std::vector<std::uint8_t>> payloads = PacketizeH264Frame(frame);
-
-    VideoFrameTransmission transmission;
-    transmission.packets.reserve(payloads.size());
-    for (std::size_t index = 0; index < payloads.size(); ++index) {
-        const std::vector<std::uint8_t> rtp_packet = BuildRtpPacket(RtpHeader{.marker = index + 1 == payloads.size(),
-                                                                              .payload_type = payload_type_,
-                                                                              .sequence_number = next_sequence_number_,
-                                                                              .timestamp = timestamp,
-                                                                              .ssrc = ssrc_},
-                                                                    payloads[index]);
-        auto srtp_packet = srtp_sender_->Protect(rtp_packet);
-        if (!srtp_packet) {
-            return std::unexpected(srtp_packet.error());
-        }
-        transmission.packets.push_back(*std::move(srtp_packet));
-        ++next_sequence_number_;
+    auto packets = packet_writer_.WriteFrame(frame, timestamp);
+    if (!packets) {
+        return std::unexpected(packets.error());
     }
 
     ++sent_frame_count_;
-    transmission.next_due_time = DueTimeOf(sent_frame_count_);
-    return transmission;
+    return VideoFrameTransmission{.packets = *std::move(packets), .next_due_time = DueTimeOf(sent_frame_count_)};
 }
 
 

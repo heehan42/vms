@@ -133,6 +133,12 @@ bool ContainsNalUnitType(const H264Frame& frame, H264NalUnitType type) {
 }  // namespace
 
 
+bool IsH264Keyframe(const H264Frame& frame) {
+    return ContainsNalUnitType(frame, H264NalUnitType::kSps) && ContainsNalUnitType(frame, H264NalUnitType::kPps) &&
+           ContainsNalUnitType(frame, H264NalUnitType::kIdrSlice);
+}
+
+
 std::expected<H264File, std::string> H264File::Load(const std::filesystem::path& path) {
     const core::UniqueFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
     if (!file.IsValid()) {

@@ -146,6 +146,19 @@ std::vector<Datagram> DtlsTransport::HandleTimeout() {
 }
 
 
+std::vector<Datagram> DtlsTransport::Close() {
+    if (state_ != DtlsState::kConnected) {
+        return {};
+    }
+
+    ::ERR_clear_error();
+    // 첫 SSL_shutdown은 close_notify를 쓰고 0을 돌려준다. 상대의 close_notify를 기다리는 두 번째 호출은 하지 않는다.
+    ::SSL_shutdown(ssl_.get());
+    state_ = DtlsState::kClosed;
+    return DrainOutput();
+}
+
+
 std::optional<std::chrono::milliseconds> DtlsTransport::NextTimeout() const {
     if (state_ == DtlsState::kFailed || state_ == DtlsState::kClosed) {
         return std::nullopt;

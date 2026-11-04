@@ -11,6 +11,7 @@
 
 #include "crypto/srtp.h"
 #include "media/h264_file.h"
+#include "webrtc/srtp_video_packet_writer.h"
 
 
 namespace vms::webrtc {
@@ -54,8 +55,8 @@ struct VideoFrameTransmission {
 //
 // 소켓과 루프를 모르며, 호출자가 시각을 넘기고 돌려받은 패킷을 보낸 뒤 다음 예정 시각에 타이머를 건다.
 // 보낸 프레임 수 n을 계속 늘리며 소스 위치는 n mod (프레임 수)이므로, 파일 끝에서 별도 분기 없이 처음으로
-// 돌아가고 순번과 타임스탬프가 이어진다. H264File은 참조만 하므로 이 객체보다 오래 살아 있어야 한다.
-// SrtpSender를 소유하므로 std::unique_ptr로만 다룬다.
+// 돌아가고 순번과 타임스탬프가 이어진다. 이 객체는 일정과 타임스탬프만 정하고, 패킷화·RTP 헤더·SRTP 보호는
+// 소유한 SrtpVideoPacketWriter가 맡는다. H264File은 참조만 하므로 이 객체보다 오래 살아 있어야 한다.
 class VideoStreamSender {
 public:
     // 송신 상태를 만든다.
@@ -86,8 +87,7 @@ public:
 
 private:
     // 구성한 상태로 객체를 만든다. Create()에서만 호출한다.
-    VideoStreamSender(const media::H264File& video_file, const VideoStreamSenderConfig& config,
-                      std::unique_ptr<crypto::SrtpSender> srtp_sender, std::uint16_t initial_sequence_number,
+    VideoStreamSender(const media::H264File& video_file, int frames_per_second, SrtpVideoPacketWriter packet_writer,
                       std::uint32_t initial_timestamp, std::chrono::steady_clock::time_point start_time);
 
 
@@ -106,20 +106,8 @@ private:
     int frames_per_second_;
 
 
-    // RTP 헤더의 SSRC
-    std::uint32_t ssrc_;
-
-
-    // RTP 헤더의 payload type
-    std::uint8_t payload_type_;
-
-
-    // 패킷 보호 상태. 순번 순환에 따른 ROC를 관리한다.
-    std::unique_ptr<crypto::SrtpSender> srtp_sender_;
-
-
-    // 다음 패킷의 순번. 패킷마다 1씩 늘고 65535 다음은 0이다.
-    std::uint16_t next_sequence_number_;
+    // 패킷화·RTP 헤더·SRTP 보호와 순번 상태
+    SrtpVideoPacketWriter packet_writer_;
 
 
     // 첫 프레임의 RTP 타임스탬프. 프레임 n의 타임스탬프는 이 값에 ⌊n × 90000 / fps⌋를 더한 값이다.

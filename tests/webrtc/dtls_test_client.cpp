@@ -94,7 +94,10 @@ std::vector<std::vector<std::uint8_t>> DtlsTestClient::Advance() {
             if (result > 0) {
                 continue;
             }
-            if (::SSL_get_error(ssl_.get(), result) != SSL_ERROR_WANT_READ) {
+            const int error = ::SSL_get_error(ssl_.get(), result);
+            if (error == SSL_ERROR_ZERO_RETURN) {
+                state_ = State::kClosed;
+            } else if (error != SSL_ERROR_WANT_READ) {
                 state_ = State::kFailed;
             }
             break;

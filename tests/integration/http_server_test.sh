@@ -256,6 +256,47 @@ kill -TERM "${server_pid}"
 wait "${server_pid}"
 server_pid=""
 
+# 카메라 인자 오류는 서버를 띄우기 전에 0이 아닌 코드로 끝나야 한다.
+expect_startup_failure "--camera에 = 없음" --camera rtsp://127.0.0.1:8554/cam
+expect_startup_failure "--camera의 빈 이름" --camera =rtsp://127.0.0.1:8554/cam
+expect_startup_failure "--camera 이름 중복" \
+    --camera front=rtsp://127.0.0.1:8554/cam --camera front=rtsp://127.0.0.1:9554/cam
+expect_startup_failure "--camera URL의 사용자 정보" --camera front=rtsp://user:pass@127.0.0.1:8554/cam
+expect_startup_failure "--camera의 해석할 수 없는 호스트" --camera front=rtsp://no-such-host.invalid/cam
+expect_equal "중복 이름 원인 출력" "1" "$(grep -c '카메라 이름이 겹칩니다: front' "${server_log}")"
+expect_equal "사용자 정보 원인 출력" "1" "$(grep -c '인증 미지원' "${server_log}")"
+
+# 꺼진 카메라(아무도 듣지 않는 포트)로도 서버는 시작하고, 카메라는 연결 상태와 관계없이 목록에 있다.
+# 카메라 이름은 파일 동영상 이름과 겹쳐도 된다.
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --video-dir "${video_dir}" \
+    --camera front=rtsp://127.0.0.1:9/cam --camera a.h264=rtsp://localhost:9/cam 2>> "${server_log}" &
+server_pid=$!
+for _ in $(seq 50); do
+    if curl -s -o /dev/null "${base_url}/"; then
+        break
+    fi
+    sleep 0.1
+done
+expect_equal "파일과 카메라의 소스 목록" \
+    '{"sources":[{"type":"file","name":"a.h264","frames":1},{"type":"file","name":"b.h264","frames":1},{"type":"camera","name":"front"},{"type":"camera","name":"a.h264"}]}' \
+    "$(curl -s "${base_url}/api/sources")"
+expect_equal "카메라 offer" "200" \
+    "$(status_of '/offer?type=camera&name=front' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "파일과 같은 이름의 카메라 offer" "200" \
+    "$(status_of '/offer?type=camera&name=a.h264' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+expect_equal "없는 카메라 offer" "404" \
+    "$(status_of '/offer?type=camera&name=missing' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
+if grep -q '카메라 연결 실패: front' "${server_log}"; then
+    expect_equal "꺼진 카메라의 연결 실패 로그" "있음" "있음"
+else
+    expect_equal "꺼진 카메라의 연결 실패 로그" "있음" "없음"
+fi
+kill -TERM "${server_pid}"
+wait "${server_pid}"
+expect_equal "카메라가 있어도 SIGTERM 후 종료 코드" "0" "$?"
+server_pid=""
+
 if (( failure_count > 0 )); then
     echo "--- 서버 로그 ---"
     cat "${server_log}"

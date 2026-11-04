@@ -306,6 +306,7 @@ IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> socke
       dtls_context_(dtls_context),
       session_timeout_(config.session_timeout),
       video_fps_(config.video_fps),
+      camera_wait_timeout_(config.camera_wait_timeout),
       sockets_(std::move(sockets)) {
     for (std::size_t index = 0; index < sockets_.size(); ++index) {
         const sockaddr_in& endpoint = sockets_[index].local_endpoint;
@@ -371,7 +372,8 @@ std::expected<IceSessionParameters, std::string> IceLiteAgent::CreateSession(
     session.ssrc = ssrc;
     session.h264_payload_type = request.h264_payload_type;
     session.video = request.video;
-    session.video_name = request.video != nullptr ? std::string(request.video_name) : std::string();
+    session.camera = request.camera;
+    session.source_label = request.source_label;
     session.last_activity_time = std::chrono::steady_clock::now();
     session.expiry_timer_id = ScheduleExpiryCheck(local_ufrag, session_timeout_);
     sessions_.emplace(local_ufrag, std::move(session));
@@ -795,27 +797,53 @@ void IceLiteAgent::FinishDtlsStep(SessionIterator session, const std::vector<Dat
 void IceLiteAgent::StartVideoStream(SessionIterator session) {
     const std::string& local_ufrag = session->first;
     Session& state = session->second;
-    if (state.video == nullptr) {
+    if (state.video == nullptr && state.camera == nullptr) {
         return;
     }
     const std::string remote_text = core::FormatIpv4Endpoint(state.nominated_pair->remote_endpoint);
 
     // kConnected가 된 DtlsTransport는 항상 키 재료를 가진다. 서버가 보내는 패킷은 서버용(local) 키를 쓴다.
     const SrtpKeyMaterial& keys = *state.dtls_transport->SrtpKeys();
-    const VideoStreamSenderConfig config{
-        .frames_per_second = video_fps_, .ssrc = state.ssrc, .payload_type = state.h264_payload_type};
-    auto sender = VideoStreamSender::Create(*state.video, config, keys.local_key, keys.local_salt,
-                                            std::chrono::steady_clock::now());
-    if (!sender) {
-        std::println(stderr, "송신 시작 실패: 세션 {}, 브라우저 {}: {}. 이 세션은 미디어를 보내지 않음", local_ufrag,
-                     remote_text, sender.error());
-        return;
+    if (state.video != nullptr) {
+        const VideoStreamSenderConfig config{.frames_per_second = video_fps_,
+                                             .ssrc = state.ssrc,
+                                             .payload_type = state.h264_payload_type,
+                                             .initial_sequence_number = std::nullopt,
+                                             .initial_timestamp = std::nullopt};
+        auto sender = VideoStreamSender::Create(*state.video, config, keys.local_key, keys.local_salt,
+                                                std::chrono::steady_clock::now());
+        if (!sender) {
+            std::println(stderr, "송신 시작 실패: 세션 {}, 브라우저 {}: {}. 이 세션은 미디어를 보내지 않음",
+                         local_ufrag, remote_text, sender.error());
+            return;
+        }
+        state.video_stream_sender = *std::move(sender);
+        state.frame_timer_id =
+            loop_.AddTimer(std::chrono::milliseconds(0), [this, local_ufrag] { HandleFrameTimer(local_ufrag); });
+    } else {
+        const bool is_camera_connected = state.camera->IsConnected();
+        const LiveVideoStreamSenderConfig config{.ssrc = state.ssrc,
+                                                 .payload_type = state.h264_payload_type,
+                                                 .initial_sequence_number = std::nullopt,
+                                                 .initial_timestamp = std::nullopt};
+        auto sender = LiveVideoStreamSender::Create(config, keys.local_key, keys.local_salt, is_camera_connected);
+        if (!sender) {
+            std::println(stderr, "송신 시작 실패: 세션 {}, 브라우저 {}: {}. 이 세션은 미디어를 보내지 않음",
+                         local_ufrag, remote_text, sender.error());
+            return;
+        }
+        state.live_stream_sender = *std::move(sender);
+        // 세션 테이블의 항목은 rehash로 옮겨질 수 있으므로, 콜백은 ufrag로 세션을 다시 찾는다.
+        state.camera_subscription = state.camera->Subscribe(
+            [this, local_ufrag](const media::LiveVideoFrame& frame) { HandleCameraFrame(local_ufrag, frame); },
+            [this, local_ufrag](media::LiveVideoEvent event) { HandleCameraEvent(local_ufrag, event); });
     }
-    state.video_stream_sender = *std::move(sender);
-    state.frame_timer_id =
-        loop_.AddTimer(std::chrono::milliseconds(0), [this, local_ufrag] { HandleFrameTimer(local_ufrag); });
-    std::println(stderr, "송신 시작: 세션 {}, 브라우저 {}, 동영상 {}, SSRC {}, payload type {}", local_ufrag,
-                 remote_text, state.video_name, state.ssrc, state.h264_payload_type);
+    std::println(stderr, "송신 시작: 세션 {}, 브라우저 {}, 소스 {}, SSRC {}, payload type {}", local_ufrag, remote_text,
+                 state.source_label, state.ssrc, state.h264_payload_type);
+
+    if (state.camera != nullptr && !state.camera->IsConnected()) {
+        StartCameraWait(session);
+    }
 }
 
 
@@ -837,20 +865,7 @@ void IceLiteAgent::HandleFrameTimer(const std::string& local_ufrag) {
         StopVideoStream(session, std::format("SRTP 보호 실패: {}", transmission.error()));
         return;
     }
-
-    // 실패한 패킷을 다시 보내면 다음 프레임이 늦어지므로 버린다. 브라우저는 다음 키프레임부터 회복한다.
-    const NominatedPair& pair = *state.nominated_pair;
-    for (const std::vector<std::uint8_t>& packet : transmission->packets) {
-        const ssize_t sent_size = ::sendto(sockets_[pair.socket_index].socket.Get(), packet.data(), packet.size(), 0,
-                                           reinterpret_cast<const sockaddr*>(&pair.remote_endpoint),
-                                           sizeof(pair.remote_endpoint));
-        if (sent_size < 0 && !state.has_logged_send_failure) {
-            state.has_logged_send_failure = true;
-            std::println(stderr, "동영상 패킷 송신 실패: 세션 {}, 브라우저 {}: {}. 이 세션의 이후 실패는 기록하지 않음",
-                         local_ufrag, core::FormatIpv4Endpoint(pair.remote_endpoint),
-                         core::LastSystemError().message());
-        }
-    }
+    SendMediaPackets(session, transmission->packets);
 
     const auto now = std::chrono::steady_clock::now();
     const auto delay = transmission->next_due_time > now
@@ -860,14 +875,113 @@ void IceLiteAgent::HandleFrameTimer(const std::string& local_ufrag) {
 }
 
 
+void IceLiteAgent::HandleCameraFrame(const std::string& local_ufrag, const media::LiveVideoFrame& frame) {
+    const auto session = sessions_.find(local_ufrag);
+    if (session == sessions_.end() || !session->second.live_stream_sender) {
+        return;
+    }
+
+    const auto packets = session->second.live_stream_sender->HandleFrame(frame, std::chrono::steady_clock::now());
+    if (!packets) {
+        StopVideoStream(session, std::format("SRTP 보호 실패: {}", packets.error()));
+        return;
+    }
+    SendMediaPackets(session, *packets);
+}
+
+
+void IceLiteAgent::HandleCameraEvent(const std::string& local_ufrag, media::LiveVideoEvent event) {
+    const auto session = sessions_.find(local_ufrag);
+    if (session == sessions_.end() || !session->second.live_stream_sender) {
+        return;
+    }
+    Session& state = session->second;
+
+    state.live_stream_sender->HandleEvent(event);
+    if (event == media::LiveVideoEvent::kDisconnected) {
+        StartCameraWait(session);
+    } else if (event == media::LiveVideoEvent::kConnected && state.camera_wait_timer_id != 0) {
+        loop_.CancelTimer(state.camera_wait_timer_id);
+        state.camera_wait_timer_id = 0;
+        std::println(stderr, "카메라 대기 끝: 세션 {}, 소스 {}, 다음 키프레임부터 송신", local_ufrag,
+                     state.source_label);
+    }
+}
+
+
+void IceLiteAgent::StartCameraWait(SessionIterator session) {
+    const std::string& local_ufrag = session->first;
+    Session& state = session->second;
+    if (state.camera_wait_timer_id != 0) {
+        return;
+    }
+    state.camera_wait_timer_id =
+        loop_.AddTimer(camera_wait_timeout_, [this, local_ufrag] { HandleCameraWaitTimeout(local_ufrag); });
+    std::println(stderr, "카메라 대기 시작: 세션 {}, 소스 {}, 최대 {}ms", local_ufrag, state.source_label,
+                 camera_wait_timeout_.count());
+}
+
+
+void IceLiteAgent::HandleCameraWaitTimeout(const std::string& local_ufrag) {
+    const auto session = sessions_.find(local_ufrag);
+    if (session == sessions_.end()) {
+        return;
+    }
+    Session& state = session->second;
+
+    // 이미 실행된 타이머이므로 ID를 지워 다시 취소하지 않게 한다.
+    state.camera_wait_timer_id = 0;
+    std::println(stderr, "카메라 대기 시간 초과: 세션 {}, 소스 {}, {}ms", local_ufrag, state.source_label,
+                 camera_wait_timeout_.count());
+
+    // 브라우저가 연결이 끝났음을 바로 알 수 있도록 close_notify를 보낸다. 세션을 지운 뒤에는 STUN에도 응답하지
+    // 않으므로 ICE도 곧 실패한다.
+    const NominatedPair& pair = *state.nominated_pair;
+    for (const Datagram& datagram : state.dtls_transport->Close()) {
+        if (::sendto(sockets_[pair.socket_index].socket.Get(), datagram.data(), datagram.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&pair.remote_endpoint), sizeof(pair.remote_endpoint)) < 0) {
+            std::println(stderr, "DTLS close_notify 송신 실패 ({}): {}", core::FormatIpv4Endpoint(pair.remote_endpoint),
+                         core::LastSystemError().message());
+        }
+    }
+    RemoveSession(session, "카메라 대기 시간 초과");
+}
+
+
+void IceLiteAgent::SendMediaPackets(SessionIterator session, const std::vector<std::vector<std::uint8_t>>& packets) {
+    Session& state = session->second;
+
+    // 실패한 패킷을 다시 보내면 다음 프레임이 늦어지므로 버린다. 브라우저는 다음 키프레임부터 회복한다.
+    const NominatedPair& pair = *state.nominated_pair;
+    for (const std::vector<std::uint8_t>& packet : packets) {
+        const ssize_t sent_size = ::sendto(sockets_[pair.socket_index].socket.Get(), packet.data(), packet.size(), 0,
+                                           reinterpret_cast<const sockaddr*>(&pair.remote_endpoint),
+                                           sizeof(pair.remote_endpoint));
+        if (sent_size < 0 && !state.has_logged_send_failure) {
+            state.has_logged_send_failure = true;
+            std::println(stderr, "동영상 패킷 송신 실패: 세션 {}, 브라우저 {}: {}. 이 세션의 이후 실패는 기록하지 않음",
+                         session->first, core::FormatIpv4Endpoint(pair.remote_endpoint),
+                         core::LastSystemError().message());
+        }
+    }
+}
+
+
 void IceLiteAgent::StopVideoStream(SessionIterator session, std::string_view reason) {
     Session& state = session->second;
-    if (!state.video_stream_sender) {
+    if (!state.video_stream_sender && !state.live_stream_sender) {
         return;
     }
     loop_.CancelTimer(state.frame_timer_id);
     state.frame_timer_id = 0;
     state.video_stream_sender.reset();
+    if (state.camera_subscription) {
+        state.camera->Unsubscribe(*state.camera_subscription);
+        state.camera_subscription.reset();
+    }
+    loop_.CancelTimer(state.camera_wait_timer_id);
+    state.camera_wait_timer_id = 0;
+    state.live_stream_sender.reset();
     std::println(stderr, "송신 중지: 세션 {}, 브라우저 {}: {}", session->first,
                  core::FormatIpv4Endpoint(state.nominated_pair->remote_endpoint), reason);
 }
@@ -888,7 +1002,7 @@ void IceLiteAgent::HandleExpiryTimeout(const std::string& local_ufrag) {
     const auto expires_at = session->second.last_activity_time + session_timeout_;
     const auto now = std::chrono::steady_clock::now();
     if (now >= expires_at) {
-        RemoveSession(session);
+        RemoveSession(session, std::format("{}ms 동안 유효한 요청 없음", session_timeout_.count()));
         return;
     }
     session->second.expiry_timer_id = ScheduleExpiryCheck(
@@ -896,10 +1010,10 @@ void IceLiteAgent::HandleExpiryTimeout(const std::string& local_ufrag) {
 }
 
 
-void IceLiteAgent::RemoveSession(SessionIterator session) {
+void IceLiteAgent::RemoveSession(SessionIterator session, std::string_view reason) {
     const std::string& local_ufrag = session->first;
     Session& state = session->second;
-    StopVideoStream(session, "세션 만료");
+    StopVideoStream(session, reason);
     loop_.CancelTimer(state.retransmission_timer_id);
     loop_.CancelTimer(state.expiry_timer_id);
 
@@ -917,8 +1031,7 @@ void IceLiteAgent::RemoveSession(SessionIterator session) {
     }
 
     LogRtcpSummary(session);
-    std::println(stderr, "ICE 세션 제거: 세션 {}, 브라우저 {}, {}ms 동안 유효한 요청 없음", local_ufrag,
-                 remote_text, session_timeout_.count());
+    std::println(stderr, "ICE 세션 제거: 세션 {}, 브라우저 {}, {}", local_ufrag, remote_text, reason);
     sessions_.erase(session);
 }
 

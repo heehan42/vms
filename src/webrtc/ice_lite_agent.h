@@ -21,8 +21,10 @@
 #include "crypto/dtls_context.h"
 #include "crypto/srtp.h"
 #include "media/h264_file.h"
+#include "media/live_video_source.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_candidate.h"
+#include "webrtc/live_video_stream_sender.h"
 #include "webrtc/rtcp_packet.h"
 #include "webrtc/video_stream_sender.h"
 
@@ -46,8 +48,14 @@ struct IceLiteAgentConfig {
     std::chrono::milliseconds session_timeout = std::chrono::seconds(30);
 
 
-    // 동영상 재생 속도(초당 프레임 수). 1 이상이어야 하며, 동영상이 지정된 세션에 공통으로 쓴다.
+    // 동영상 재생 속도(초당 프레임 수). 1 이상이어야 하며, 파일 동영상이 지정된 세션에 공통으로 쓴다.
     int video_fps = 30;
+
+
+    // 카메라 세션이 DTLS 완료 뒤 끊긴 카메라를 기다리는 최대 시간. 지나면 close_notify를 보내고 세션을 제거한다.
+    //
+    // 명령행 인자로는 노출하지 않으며, 테스트가 짧은 값을 쓰기 위해 둔다.
+    std::chrono::milliseconds camera_wait_timeout = std::chrono::seconds(30);
 };
 
 
@@ -66,14 +74,20 @@ struct IceSessionRequest {
     std::uint8_t h264_payload_type = 0;
 
 
-    // DTLS가 완료되면 이 세션에 보낼 동영상. nullptr이면 이 세션에는 미디어를 보내지 않는다.
+    // DTLS가 완료되면 이 세션에 첫 프레임부터 보낼 파일 동영상. camera와 함께 지정하지 않는다.
     //
     // 참조만 하므로 에이전트보다 오래 살아 있어야 한다. 보통 VideoLibrary의 항목을 가리킨다.
     const media::H264File* video = nullptr;
 
 
-    // video의 이름. 송신 시작 로그에 쓰며, 세션이 복사해 보관한다. video가 nullptr이면 쓰지 않는다.
-    std::string_view video_name;
+    // DTLS가 완료되면 이 세션이 구독할 카메라 소스. video와 함께 지정하지 않는다. 둘 다 nullptr이면 미디어를 보내지 않는다.
+    //
+    // 참조만 하므로 에이전트보다 오래 살아 있어야 한다. 보통 CameraList 항목의 소스를 가리킨다.
+    media::LiveVideoSource* camera = nullptr;
+
+
+    // 소스 종류와 이름을 담은 로그용 문자열. 예: "file a.h264", "camera front". 세션이 복사해 보관한다.
+    std::string_view source_label;
 };
 
 
@@ -154,8 +168,10 @@ struct RtcpReceiveStats {
 // 브라우저의 nomination을 받아들이기만 하며, 먼저 요청을 보내지 않는다.
 // 설정한 주소마다 UDP 소켓 하나를 소유하고, 모든 세션이 이 소켓들을 함께 쓴다. 응답은 요청이 도착한
 // 소켓에서 보내 출발 주소가 요청의 목적지와 같게 한다.
-// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 동영상이 지정된 세션은 DTLS가 완료되면
-// VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다.
+// 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 파일 동영상이 지정된 세션은 DTLS가 완료되면
+// VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다. 카메라가 지정된 세션은 DTLS가
+// 완료되면 LiveVideoStreamSender를 만들고 카메라 소스를 구독해, 프레임이 올 때마다 보낸다. 카메라가 끊겨 있으면
+// camera_wait_timeout 동안 기다리고, 그래도 돌아오지 않으면 close_notify를 보내고 세션을 제거한다.
 // 루프 핸들러와 타이머가 이 객체의 주소를 캡처하므로 std::unique_ptr로만 다루며 이동하지 않는다.
 // 연결된 EventLoop와 DtlsContext보다 먼저 소멸해야 한다.
 class IceLiteAgent {
@@ -319,12 +335,16 @@ private:
         std::uint8_t h264_payload_type = 0;
 
 
-        // DTLS가 완료되면 보낼 동영상. nullptr이면 미디어를 보내지 않는다. 에이전트보다 오래 산다.
+        // DTLS가 완료되면 보낼 파일 동영상. nullptr이면 파일을 보내지 않는다. 에이전트보다 오래 산다.
         const media::H264File* video = nullptr;
 
 
-        // video의 이름. 송신 시작 로그에 쓴다.
-        std::string video_name;
+        // DTLS가 완료되면 구독할 카메라 소스. nullptr이면 카메라를 보내지 않는다. 에이전트보다 오래 산다.
+        media::LiveVideoSource* camera = nullptr;
+
+
+        // 소스 종류와 이름을 담은 로그용 문자열. 소스가 없으면 비어 있다.
+        std::string source_label;
 
 
         // 동영상 송신 상태. DTLS가 완료되고 동영상이 지정되어 있을 때 만들며, 송신을 멈추면 지운다.
@@ -335,6 +355,20 @@ private:
 
         // 걸려 있는 프레임 타이머. 없으면 0
         core::EventLoop::TimerId frame_timer_id = 0;
+
+
+        // 카메라 송신 상태. DTLS가 완료되고 카메라가 지정되어 있을 때 만들며, 송신을 멈추면 지운다.
+        //
+        // 값이 있는 동안 camera_subscription이 걸려 있다.
+        std::unique_ptr<LiveVideoStreamSender> live_stream_sender;
+
+
+        // 카메라 소스의 구독 ID. live_stream_sender와 함께 생기고 사라진다.
+        std::optional<media::LiveVideoSource::SubscriptionId> camera_subscription;
+
+
+        // 걸려 있는 카메라 대기 타이머. 카메라가 끊긴 동안만 걸려 있으며, 없으면 0
+        core::EventLoop::TimerId camera_wait_timer_id = 0;
 
 
         // 동영상 패킷의 송신 실패를 이미 로그에 남겼는지 여부. 세션마다 첫 실패만 남긴다.
@@ -471,13 +505,51 @@ private:
                         DtlsState previous_state);
 
 
-    // DTLS가 완료된 세션의 동영상 송신을 시작한다. 세션에 동영상이 지정되지 않았으면 아무것도 하지 않는다.
+    // DTLS가 완료된 세션의 송신을 시작한다. 세션에 소스가 지정되지 않았으면 아무것도 하지 않는다.
     //
     // session: kConnected가 된 DtlsTransport를 가진 세션
     //
-    // 서버용 SRTP 키로 VideoStreamSender를 만들고 0ms 프레임 타이머를 건다. 생성에 실패하면 로그만
-    // 남기며 DTLS는 연결된 채로 둔다.
+    // 파일이면 서버용 SRTP 키로 VideoStreamSender를 만들고 0ms 프레임 타이머를 건다. 카메라이면
+    // LiveVideoStreamSender를 만들어 카메라 소스를 구독하고, 카메라가 끊겨 있으면 대기 타이머를 건다. 생성에
+    // 실패하면 로그만 남기며 DTLS는 연결된 채로 둔다.
     void StartVideoStream(SessionIterator session);
+
+
+    // 카메라 소스가 넘긴 프레임을 세션의 송신 상태로 패킷화해 nominated pair로 보낸다.
+    //
+    // local_ufrag: 구독한 세션의 서버 ufrag
+    // frame: 구독 콜백이 받은 프레임. 호출 동안만 유효하다.
+    //
+    // SRTP 보호가 실패하면 그 세션의 송신을 멈추고 구독을 해지한다(구독 콜백 안에서 해지해도 안전하다).
+    void HandleCameraFrame(const std::string& local_ufrag, const media::LiveVideoFrame& frame);
+
+
+    // 카메라 소스의 상태 변화를 세션의 송신 상태에 반영하고, 끊기면 대기를 시작하고 연결되면 끝낸다.
+    //
+    // local_ufrag: 구독한 세션의 서버 ufrag
+    // event: 구독 콜백이 받은 상태 변화
+    void HandleCameraEvent(const std::string& local_ufrag, media::LiveVideoEvent event);
+
+
+    // 카메라 대기 타이머를 걸고 "대기 시작"을 로그에 남긴다. 이미 걸려 있으면 아무것도 하지 않는다.
+    //
+    // session: 카메라 세션
+    void StartCameraWait(SessionIterator session);
+
+
+    // 카메라 대기 시간이 지났을 때 close_notify를 nominated pair로 보내고 세션을 제거한다.
+    //
+    // local_ufrag: 타이머를 건 세션의 서버 ufrag. 그 사이 세션이 제거되었으면 아무것도 하지 않는다.
+    void HandleCameraWaitTimeout(const std::string& local_ufrag);
+
+
+    // SRTP 패킷 목록을 세션의 nominated pair로 보낸다.
+    //
+    // session: 송신 중인 세션
+    // packets: 순서대로 보낼 패킷
+    //
+    // 실패한 패킷은 다시 보내지 않고 버리며, 세션마다 첫 실패만 로그에 남긴다.
+    void SendMediaPackets(SessionIterator session, const std::vector<std::vector<std::uint8_t>>& packets);
 
 
     // 프레임 타이머가 실행되었을 때 예정된 프레임을 nominated pair로 보내고 다음 프레임 타이머를 건다.
@@ -489,12 +561,13 @@ private:
     void HandleFrameTimer(const std::string& local_ufrag);
 
 
-    // 세션의 동영상 송신을 멈추고 로그를 남긴다. 송신 중이 아니면 아무것도 하지 않는다.
+    // 세션의 송신을 멈추고 로그를 남긴다. 송신 중이 아니면 아무것도 하지 않는다.
     //
     // session: 송신을 멈출 세션
     // reason: 로그에 남길 중지 원인
     //
-    // 프레임 타이머를 취소하고 VideoStreamSender를 지운다. 세션 자체는 그대로 둔다.
+    // 파일이면 프레임 타이머를 취소하고 VideoStreamSender를 지운다. 카메라이면 구독을 해지하고 대기 타이머를 취소한 뒤
+    // LiveVideoStreamSender를 지운다. 세션 자체는 그대로 둔다.
     void StopVideoStream(SessionIterator session, std::string_view reason);
 
 
@@ -520,10 +593,11 @@ private:
     // 세션을 제거하고 로그를 남긴다.
     //
     // session: 제거할 세션. 호출 뒤에는 무효다.
+    // reason: 로그에 남길 제거 원인
     //
     // 송신 중지, 타이머 취소, nominated pair 테이블 항목 삭제, RTCP 수신 요약 로그, 세션 삭제 순서로 한다. 세션을 지우면
     // DtlsTransport의 SSL이 함께 해제된다.
-    void RemoveSession(SessionIterator session);
+    void RemoveSession(SessionIterator session, std::string_view reason);
 
 
     // STUN이 아닌 패킷을 버렸다는 로그를 원격 주소마다 처음 한 번만 남긴다.
@@ -549,6 +623,10 @@ private:
 
     // 동영상 재생 속도(초당 프레임 수)
     int video_fps_;
+
+
+    // 카메라 세션이 끊긴 카메라를 기다리는 최대 시간
+    std::chrono::milliseconds camera_wait_timeout_;
 
 
     // 주소별 UDP 소켓. 설정 주소 순서이며 candidates_와 같은 위치끼리 대응한다.

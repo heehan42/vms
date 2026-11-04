@@ -36,6 +36,9 @@ public:
 
         // 핸드셰이크나 레코드 처리 오류
         kFailed,
+
+        // 서버의 close_notify를 받음
+        kClosed,
     };
 
 

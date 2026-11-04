@@ -31,15 +31,24 @@ add_library(server_core STATIC
     src/http/mime_type.cpp
     src/http/query_string.cpp
     src/http/static_files.cpp
+    src/media/camera_list.cpp
     src/media/h264_file.cpp
+    src/media/h264_sps.cpp
+    src/media/live_video_source.cpp
     src/media/video_library.cpp
+    src/rtsp/h264_rtp_depacketizer.cpp
+    src/rtsp/rtsp_camera_client.cpp
+    src/rtsp/rtsp_message.cpp
+    src/rtsp/rtsp_url.cpp
     src/webrtc/dtls_transport.cpp
     src/webrtc/h264_packetizer.cpp
     src/webrtc/ice_lite_agent.cpp
+    src/webrtc/live_video_stream_sender.cpp
     src/webrtc/rtcp_packet.cpp
     src/webrtc/rtp_packet.cpp
     src/webrtc/sdp.cpp
     src/webrtc/signaling.cpp
+    src/webrtc/srtp_video_packet_writer.cpp
     src/webrtc/stun_message.cpp
     src/webrtc/video_stream_sender.cpp
 )

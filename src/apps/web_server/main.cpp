@@ -1,10 +1,12 @@
 #include <signal.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <optional>
 #include <print>
 #include <span>
@@ -13,12 +15,16 @@
 #include <vector>
 
 #include "core/event_loop.h"
+#include "core/json.h"
 #include "core/network_interfaces.h"
 #include "core/termination_signal_watcher.h"
 #include "crypto/certificate.h"
 #include "crypto/dtls_context.h"
 #include "http/http_server.h"
+#include "media/camera_list.h"
 #include "media/video_library.h"
+#include "rtsp/rtsp_camera_client.h"
+#include "rtsp/rtsp_url.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_lite_agent.h"
 #include "webrtc/signaling.h"
@@ -32,7 +38,11 @@ using vms::crypto::DtlsContext;
 using vms::http::HttpRequest;
 using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
+using vms::media::CameraList;
 using vms::media::VideoLibrary;
+using vms::rtsp::RtspCameraClient;
+using vms::rtsp::RtspCameraClientConfig;
+using vms::rtsp::RtspUrl;
 using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
@@ -46,7 +56,8 @@ namespace {
 constexpr std::string_view kUsage =
     "사용법: vms_web_server [--port <1-65535>] [--web-root <디렉터리>]\n"
     "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...\n"
-    "                      [--video-dir <H.264 Annex-B 파일 디렉터리>] [--video-fps <1-120>]";
+    "                      [--video-dir <H.264 Annex-B 파일 디렉터리>] [--video-fps <1-120>]\n"
+    "                      [--camera <이름>=rtsp://<호스트>[:<포트>][/<경로>]]...";
 
 
 // --video-fps를 생략했을 때의 재생 속도
@@ -55,6 +66,17 @@ constexpr int kDefaultVideoFps = 30;
 
 // --video-fps로 받을 수 있는 최대 재생 속도
 constexpr int kMaxVideoFps = 120;
+
+
+// --camera로 등록한 카메라 하나.
+struct CameraOption {
+    // 카메라 이름. 비어 있지 않은 UTF-8이며 다른 카메라와 겹치지 않는다.
+    std::string name;
+
+
+    // 해석한 카메라 URL
+    RtspUrl url;
+};
 
 
 // 명령행으로 받는 서버 전체의 실행 설정.
@@ -77,6 +99,10 @@ struct ServerOptions {
 
     // 동영상 재생 속도(초당 프레임 수). 목록의 모든 동영상에 적용한다.
     int video_fps = kDefaultVideoFps;
+
+
+    // --camera로 등록한 카메라. 쓴 순서대로이며 목록 순서가 된다.
+    std::vector<CameraOption> cameras;
 };
 
 
@@ -108,15 +134,47 @@ std::expected<int, std::string> ParseVideoFps(std::string_view text) {
 }
 
 
+// --camera 값을 카메라 이름과 URL로 나눈다.
+//
+// value: "<이름>=<URL>" 형식의 값
+// registered: 이미 등록한 카메라. 이름 중복 검사에 쓴다.
+// 반환값: 등록할 카메라. '='가 없거나, 이름이 비었거나 UTF-8이 아니거나 이미 있거나, URL이 잘못되었으면 오류 메시지
+//
+// 첫 '='에서 나누므로 URL에는 '='가 들어가도 된다. 카메라 이름은 파일 동영상 이름과 겹쳐도 된다.
+std::expected<CameraOption, std::string> ParseCameraOption(std::string_view value,
+                                                           const std::vector<CameraOption>& registered) {
+    const std::size_t separator = value.find('=');
+    if (separator == std::string_view::npos) {
+        return std::unexpected(std::format("--camera 값은 <이름>=<URL> 형식이어야 합니다: {}", value));
+    }
+    const std::string_view name = value.substr(0, separator);
+    if (name.empty()) {
+        return std::unexpected(std::format("--camera의 카메라 이름이 비어 있습니다: {}", value));
+    }
+    if (!vms::core::IsValidUtf8(name)) {
+        return std::unexpected("--camera의 카메라 이름이 UTF-8이 아닙니다");
+    }
+    if (std::ranges::any_of(registered, [name](const CameraOption& camera) { return camera.name == name; })) {
+        return std::unexpected(std::format("--camera의 카메라 이름이 겹칩니다: {}", name));
+    }
+    auto url = vms::rtsp::ParseRtspUrl(value.substr(separator + 1));
+    if (!url) {
+        return std::unexpected(std::format("--camera {}의 URL 오류: {}", name, url.error()));
+    }
+    return CameraOption{.name = std::string(name), .url = *std::move(url)};
+}
+
+
 // 명령행 인자를 서버 설정으로 바꾼다.
 //
 // arguments: 프로그램 이름을 제외한 인자 목록
 // 반환값: 해석 결과
 //   - 서버 설정: 생략한 항목은 기본값(포트 8080, 웹 루트 ./web, ICE 포트 50000, ICE 주소 자동,
-//     동영상 없음, 30fps)이다.
-//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도
+//     동영상 없음, 30fps, 카메라 없음)이다.
+//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도·카메라
 //
-// --ice-address는 여러 번 쓸 수 있으며, 쓴 순서가 candidate 우선순위 순서가 된다.
+// --ice-address는 여러 번 쓸 수 있으며, 쓴 순서가 candidate 우선순위 순서가 된다. --camera도 여러 번 쓸 수 있으며,
+// 쓴 순서가 카메라 목록 순서가 된다. 카메라 호스트 이름은 여기서 해석하지 않는다.
 std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const> arguments) {
     ServerOptions options;
     options.http = HttpServerConfig{.port = 8080, .web_root = "web"};
@@ -124,7 +182,8 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const std::string_view option = arguments[index];
         if (option != "--port" && option != "--web-root" && option != "--ice-port" &&
-            option != "--ice-address" && option != "--video-dir" && option != "--video-fps") {
+            option != "--ice-address" && option != "--video-dir" && option != "--video-fps" &&
+            option != "--camera") {
             return std::unexpected(std::format("알 수 없는 인자: {}", option));
         }
         if (index + 1 >= arguments.size()) {
@@ -142,6 +201,12 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             options.http.web_root = value;
         } else if (option == "--video-dir") {
             options.video_dir = fs::path(value);
+        } else if (option == "--camera") {
+            auto camera = ParseCameraOption(value, options.cameras);
+            if (!camera) {
+                return std::unexpected(camera.error());
+            }
+            options.cameras.push_back(*std::move(camera));
         } else if (option == "--video-fps") {
             const auto fps = ParseVideoFps(value);
             if (!fps) {
@@ -246,16 +311,43 @@ int main(int argc, char* argv[]) {
                      options->video_dir->string());
     }
 
+    // 카메라 호스트 이름은 getaddrinfo가 블로킹이므로 루프를 돌리기 전에 한 번만 해석한다. 세션이 카메라 소스를
+    // 구독하므로 카메라 목록은 에이전트보다 먼저 만들어 나중에 소멸하게 한다.
+    CameraList cameras;
+    std::vector<RtspCameraClientConfig> camera_client_configs;
+    for (CameraOption& camera : options->cameras) {
+        const auto address = vms::rtsp::ResolveIpv4Address(camera.url.host);
+        if (!address) {
+            std::println(stderr, "--camera {}: {}", camera.name, address.error());
+            return 1;
+        }
+        std::println(stderr, "카메라 등록: {}, {} (주소 {}:{})", camera.name, camera.url.request_url,
+                     vms::core::FormatIpv4Address(*address), camera.url.port);
+        cameras.Add(camera.name, camera.url.request_url);
+        camera_client_configs.push_back(
+            RtspCameraClientConfig{.camera_name = camera.name, .url = std::move(camera.url), .address = *address});
+    }
+    if (!cameras.Entries().empty()) {
+        std::println(stderr, "카메라 목록: {}대", cameras.Entries().size());
+    }
+
     auto loop = EventLoop::Create();
     if (!loop) {
         std::println(stderr, "이벤트 루프 생성 실패: {}", loop.error().message());
         return 1;
     }
 
-    // 종료 시그널을 받으면 루프를 멈추고, 아래의 정상 종료 경로로 이어지게 한다.
-    auto signal_watcher = TerminationSignalWatcher::Start(*loop, [&loop](int signal_number) {
+    // 카메라 클라이언트는 루프와 카메라 소스를 참조하므로 둘보다 나중에 선언해 먼저 소멸하게 한다. 에이전트보다는
+    // 나중에 소멸하지만, 에이전트가 소멸할 때 구독을 모두 해지하므로 끊김 알림이 소멸한 세션에 가지 않는다.
+    std::vector<std::unique_ptr<RtspCameraClient>> camera_clients;
+
+    // 종료 시그널을 받으면 카메라에 TEARDOWN을 보내고 루프를 멈춰, 아래의 정상 종료 경로로 이어지게 한다.
+    auto signal_watcher = TerminationSignalWatcher::Start(*loop, [&loop, &camera_clients](int signal_number) {
         std::println(stderr, "{} 수신, 서버를 종료합니다",
                      signal_number == SIGINT ? "SIGINT" : "SIGTERM");
+        for (const std::unique_ptr<RtspCameraClient>& client : camera_clients) {
+            client->Stop();
+        }
         loop->Stop();
     });
     if (!signal_watcher) {
@@ -292,9 +384,9 @@ int main(int argc, char* argv[]) {
     }
 
     // 웹 서버의 /offer 핸들러가 같은 프로세스의 ICE-lite 에이전트를 직접 호출한다.
-    // 소멸은 선언 역순이므로 HttpServer가 Signaling보다, Signaling이 에이전트, 인증서, 동영상 목록보다
+    // 소멸은 선언 역순이므로 HttpServer가 Signaling보다, Signaling이 에이전트, 인증서, 동영상·카메라 목록보다
     // 먼저 사라진다.
-    Signaling signaling(**ice_agent, *certificate, video_library);
+    Signaling signaling(**ice_agent, *certificate, video_library, cameras);
     vms::http::HttpEndpoints endpoints;
     endpoints.post.emplace("/offer", [&signaling](const HttpRequest& request, std::string_view body) {
         return signaling.HandleOffer(request, body);
@@ -309,6 +401,13 @@ int main(int argc, char* argv[]) {
     }
     std::println(stderr, "http://0.0.0.0:{}/ 에서 대기 중 (웹 루트: {})", options->http.port,
                  options->http.web_root.string());
+
+    // 카메라 연결 실패는 시작 오류가 아니다. 클라이언트가 로그를 남기고 재연결 간격 뒤 다시 시도한다.
+    for (std::size_t index = 0; index < camera_client_configs.size(); ++index) {
+        camera_clients.push_back(RtspCameraClient::Create(*loop, std::move(camera_client_configs[index]),
+                                                          cameras.Entries()[index]->source));
+        camera_clients.back()->Start();
+    }
 
     if (const std::error_code run_error = loop->Run()) {
         std::println(stderr, "이벤트 루프 오류: {}", run_error.message());
