@@ -16,6 +16,9 @@ base_url="http://localhost:${port}"
 
 work_dir="$(mktemp -d)"
 web_root="${work_dir}/web"
+# 카메라를 등록하는 실행이 실행 위치에 recordings/를 만들지 않도록 임시 녹화 디렉터리를 쓴다.
+record_dir="${work_dir}/recordings"
+no_camera_record_dir="${work_dir}/no_camera_recordings"
 server_log="${work_dir}/server.log"
 server_pid=""
 failure_count=0
@@ -74,7 +77,7 @@ printf 'secret' > "${web_root}/unreadable.txt"
 chmod 000 "${web_root}/unreadable.txt"
 
 "${server_binary}" --port "${port}" --web-root "${web_root}" \
-    --ice-address 127.0.0.1 --ice-port "${ice_port}" 2> "${server_log}" &
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --record-dir "${no_camera_record_dir}" 2> "${server_log}" &
 server_pid=$!
 
 # 서버가 연결을 받을 수 있을 때까지 최대 5초 기다린다.
@@ -197,6 +200,11 @@ kill -TERM "${server_pid}"
 wait "${server_pid}"
 expect_equal "SIGTERM 후 종료 코드" "0" "$?"
 server_pid=""
+if [[ -e "${no_camera_record_dir}" ]]; then
+    expect_equal "카메라 없이 실행하면 녹화 디렉터리 없음" "없음" "있음"
+else
+    expect_equal "카메라 없이 실행하면 녹화 디렉터리 없음" "없음" "없음"
+fi
 
 # 동영상 인자 오류는 서버를 띄우기 전에 0이 아닌 코드로 끝나야 한다.
 # 잘못 시작해 대기하는 경우에도 테스트가 멈추지 않도록 timeout으로 감싼다.
@@ -205,7 +213,7 @@ expect_startup_failure() {
     local description="$1"
     shift
     timeout 5 "${server_binary}" --port "${port}" --web-root "${web_root}" \
-        --ice-address 127.0.0.1 --ice-port "${ice_port}" "$@" 2>> "${server_log}"
+        --ice-address 127.0.0.1 --ice-port "${ice_port}" --record-dir "${record_dir}" "$@" 2>> "${server_log}"
     local exit_code=$?
     if (( exit_code != 0 && exit_code != 124 )); then
         expect_equal "${description}" "0이 아님" "0이 아님"
@@ -266,10 +274,48 @@ expect_startup_failure "--camera의 해석할 수 없는 호스트" --camera fro
 expect_equal "중복 이름 원인 출력" "1" "$(grep -c '카메라 이름이 겹칩니다: front' "${server_log}")"
 expect_equal "사용자 정보 원인 출력" "1" "$(grep -c '인증 미지원' "${server_log}")"
 
+# 카메라 이름은 녹화 폴더 이름이 되므로 폴더 이름으로 쓸 수 없는 이름은 거부한다.
+long_camera_name="$(head -c 256 /dev/zero | tr '\0' 'a')"
+expect_startup_failure "--camera 이름의 /" --camera a/b=rtsp://127.0.0.1:8554/cam
+expect_startup_failure "--camera 이름 .." --camera ..=rtsp://127.0.0.1:8554/cam
+expect_startup_failure "--camera 이름 ." --camera .=rtsp://127.0.0.1:8554/cam
+expect_startup_failure "--camera 이름 256바이트" --camera "${long_camera_name}=rtsp://127.0.0.1:8554/cam"
+expect_equal "/ 포함 이름 원인 출력" "1" "$(grep -c "카메라 이름에 '/'를 쓸 수 없습니다: a/b" "${server_log}")"
+
+# 녹화 인자 범위 오류
+camera_argument=(--camera front=rtsp://127.0.0.1:9/cam)
+expect_startup_failure "--record-segment 5" --record-segment 5 "${camera_argument[@]}"
+expect_startup_failure "--record-segment 3601" --record-segment 3601 "${camera_argument[@]}"
+expect_startup_failure "--record-retention이 단위보다 작음" \
+    --record-segment 60 --record-retention 30 "${camera_argument[@]}"
+expect_startup_failure "--record-retention 604801" --record-retention 604801 "${camera_argument[@]}"
+expect_startup_failure "--record-sync 0" --record-sync 0 "${camera_argument[@]}"
+expect_startup_failure "--record-sync가 단위보다 큼" --record-segment 10 --record-sync 11 "${camera_argument[@]}"
+expect_startup_failure "--record-min-free -1" --record-min-free -1 "${camera_argument[@]}"
+expect_startup_failure "숫자가 아닌 --record-segment" --record-segment abc "${camera_argument[@]}"
+expect_startup_failure "알 수 없는 녹화 인자" --record-foo 1 "${camera_argument[@]}"
+expect_equal "보관 분량 원인 출력" "1" "$(grep -c -- '--record-retention(30초)은 --record-segment(60초) 이상' "${server_log}")"
+
+# 쓸 수 없는 녹화 디렉터리. root는 권한과 관계없이 쓸 수 있으므로 건너뛴다.
+if (( EUID == 0 )); then
+    echo "건너뜀: 쓸 수 없는 녹화 디렉터리 (root로 실행 중)"
+else
+    read_only_dir="${work_dir}/read_only"
+    mkdir -p "${read_only_dir}"
+    chmod 555 "${read_only_dir}"
+    expect_startup_failure "쓸 수 없는 녹화 디렉터리" --record-dir "${read_only_dir}/recordings" "${camera_argument[@]}"
+    mkdir -p "${read_only_dir}/existing" 2>/dev/null
+    chmod 755 "${read_only_dir}"
+    mkdir -p "${read_only_dir}/existing/front"
+    chmod 555 "${read_only_dir}/existing/front"
+    expect_startup_failure "쓸 수 없는 카메라 폴더" --record-dir "${read_only_dir}/existing" "${camera_argument[@]}"
+    chmod 755 "${read_only_dir}/existing/front"
+fi
+
 # 꺼진 카메라(아무도 듣지 않는 포트)로도 서버는 시작하고, 카메라는 연결 상태와 관계없이 목록에 있다.
 # 카메라 이름은 파일 동영상 이름과 겹쳐도 된다.
 "${server_binary}" --port "${port}" --web-root "${web_root}" \
-    --ice-address 127.0.0.1 --ice-port "${ice_port}" --video-dir "${video_dir}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --video-dir "${video_dir}" --record-dir "${record_dir}" \
     --camera front=rtsp://127.0.0.1:9/cam --camera a.h264=rtsp://localhost:9/cam 2>> "${server_log}" &
 server_pid=$!
 for _ in $(seq 50); do
@@ -292,9 +338,39 @@ if grep -q '카메라 연결 실패: front' "${server_log}"; then
 else
     expect_equal "꺼진 카메라의 연결 실패 로그" "있음" "없음"
 fi
+if [[ -d "${record_dir}/front" && -d "${record_dir}/a.h264" ]]; then
+    expect_equal "카메라마다 녹화 폴더 생성" "있음" "있음"
+else
+    expect_equal "카메라마다 녹화 폴더 생성" "있음" "없음"
+fi
+expect_equal "녹화 설정 시작 로그" "1" \
+    "$(grep -c "^녹화 설정: 디렉터리 ${record_dir}, 단위 60초, 보관 300초, 동기화 10초, 최소 여유 공간 1024MiB$" \
+        "${server_log}")"
 kill -TERM "${server_pid}"
 wait "${server_pid}"
 expect_equal "카메라가 있어도 SIGTERM 후 종료 코드" "0" "$?"
+server_pid=""
+
+# 한글 카메라 이름으로 시작하고, 그 이름의 녹화 폴더가 생긴다.
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --record-dir "${record_dir}" \
+    --camera 정문=rtsp://127.0.0.1:9/cam 2>> "${server_log}" &
+server_pid=$!
+for _ in $(seq 50); do
+    if curl -s -o /dev/null "${base_url}/"; then
+        break
+    fi
+    sleep 0.1
+done
+expect_equal "한글 카메라 이름의 소스 목록" '{"sources":[{"type":"camera","name":"정문"}]}' \
+    "$(curl -s "${base_url}/api/sources")"
+if [[ -d "${record_dir}/정문" ]]; then
+    expect_equal "한글 이름의 녹화 폴더" "있음" "있음"
+else
+    expect_equal "한글 이름의 녹화 폴더" "있음" "없음"
+fi
+kill -TERM "${server_pid}"
+wait "${server_pid}"
 server_pid=""
 
 if (( failure_count > 0 )); then

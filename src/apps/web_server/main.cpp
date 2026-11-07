@@ -1,6 +1,8 @@
 #include <signal.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <charconv>
 #include <cstdint>
 #include <expected>
@@ -17,12 +19,17 @@
 #include "core/event_loop.h"
 #include "core/json.h"
 #include "core/network_interfaces.h"
+#include "core/system_error.h"
 #include "core/termination_signal_watcher.h"
 #include "crypto/certificate.h"
 #include "crypto/dtls_context.h"
 #include "http/http_server.h"
 #include "media/camera_list.h"
 #include "media/video_library.h"
+#include "recording/camera_recorder.h"
+#include "recording/recording_options.h"
+#include "recording/recording_recovery.h"
+#include "recording/recording_writer.h"
 #include "rtsp/rtsp_camera_client.h"
 #include "rtsp/rtsp_url.h"
 #include "webrtc/dtls_transport.h"
@@ -40,6 +47,10 @@ using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
 using vms::media::CameraList;
 using vms::media::VideoLibrary;
+using vms::recording::CameraRecorder;
+using vms::recording::RecordedFileCatalog;
+using vms::recording::RecordingOptions;
+using vms::recording::RecordingWriter;
 using vms::rtsp::RtspCameraClient;
 using vms::rtsp::RtspCameraClientConfig;
 using vms::rtsp::RtspUrl;
@@ -57,7 +68,10 @@ constexpr std::string_view kUsage =
     "사용법: vms_web_server [--port <1-65535>] [--web-root <디렉터리>]\n"
     "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...\n"
     "                      [--video-dir <H.264 Annex-B 파일 디렉터리>] [--video-fps <1-120>]\n"
-    "                      [--camera <이름>=rtsp://<호스트>[:<포트>][/<경로>]]...";
+    "                      [--camera <이름>=rtsp://<호스트>[:<포트>][/<경로>]]...\n"
+    "                      [--record-dir <녹화 디렉터리>] [--record-segment <10-3600초>]\n"
+    "                      [--record-retention <단위 시간-604800초>] [--record-sync <1-단위 시간 초>]\n"
+    "                      [--record-min-free <0-1048576MiB>]";
 
 
 // --video-fps를 생략했을 때의 재생 속도
@@ -68,9 +82,29 @@ constexpr int kDefaultVideoFps = 30;
 constexpr int kMaxVideoFps = 120;
 
 
+// --record-segment로 받을 수 있는 최소 단위 시간(초)
+constexpr int kMinRecordSegmentSeconds = 10;
+
+
+// --record-segment로 받을 수 있는 최대 단위 시간(초)
+constexpr int kMaxRecordSegmentSeconds = 3600;
+
+
+// --record-retention으로 받을 수 있는 최대 보관 분량(초, 7일)
+constexpr int kMaxRecordRetentionSeconds = 604800;
+
+
+// --record-min-free로 받을 수 있는 최대 여유 공간(MiB, 1TiB)
+constexpr std::int64_t kMaxRecordMinFreeMib = 1048576;
+
+
+// 카메라 이름이 폴더 이름이 되므로 받을 수 있는 최대 길이(바이트). 대부분의 파일 시스템의 이름 길이 한도다.
+constexpr std::size_t kMaxCameraNameBytes = 255;
+
+
 // --camera로 등록한 카메라 하나.
 struct CameraOption {
-    // 카메라 이름. 비어 있지 않은 UTF-8이며 다른 카메라와 겹치지 않는다.
+    // 카메라 이름. 비어 있지 않은 UTF-8이며 다른 카메라와 겹치지 않고, 녹화 폴더 이름으로 쓸 수 있다.
     std::string name;
 
 
@@ -103,6 +137,10 @@ struct ServerOptions {
 
     // --camera로 등록한 카메라. 쓴 순서대로이며 목록 순서가 된다.
     std::vector<CameraOption> cameras;
+
+
+    // --record-* 인자로 정한 녹화 설정. 카메라가 있을 때만 녹화한다.
+    RecordingOptions recording;
 };
 
 
@@ -134,11 +172,118 @@ std::expected<int, std::string> ParseVideoFps(std::string_view text) {
 }
 
 
+// 정수 인자를 읽고 범위를 검사한다.
+//
+// option: 오류 메시지에 쓸 인자 이름
+// text: 10진수 문자열
+// minimum, maximum: 받을 수 있는 범위(포함)
+// 반환값: 읽은 값. 정수가 아니거나 범위를 벗어나면 오류 메시지
+std::expected<std::int64_t, std::string> ParseIntegerInRange(std::string_view option, std::string_view text,
+                                                             std::int64_t minimum, std::int64_t maximum) {
+    std::int64_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc() || end != text.data() + text.size() || value < minimum || value > maximum) {
+        return std::unexpected(std::format("잘못된 {} 값: {} ({}~{} 정수)", option, text, minimum, maximum));
+    }
+    return value;
+}
+
+
+// 녹화 인자인지 확인한다.
+//
+// option: 명령행 인자 이름
+// 반환값: --record-dir, --record-segment, --record-retention, --record-sync, --record-min-free 중 하나이면 true
+bool IsRecordingOption(std::string_view option) {
+    return option == "--record-dir" || option == "--record-segment" || option == "--record-retention" ||
+           option == "--record-sync" || option == "--record-min-free";
+}
+
+
+// 녹화 인자 하나를 설정에 반영한다.
+//
+// option: --record-로 시작하는 인자 이름
+// value: 인자 값
+// recording: 반영할 녹화 설정
+// 반환값: 성공하면 빈 값. 정수가 아니거나 그 인자만으로 정해지는 범위를 벗어나면 오류 메시지
+//
+// 다른 인자와 비교하는 범위(보관 분량과 동기화 주기는 단위 시간에 따름)는 모든 인자를 읽은 뒤
+// CheckRecordingOptions에서 검사한다.
+std::expected<void, std::string> ApplyRecordingOption(std::string_view option, std::string_view value,
+                                                      RecordingOptions& recording) {
+    if (option == "--record-dir") {
+        recording.directory = fs::path(value);
+        return {};
+    }
+
+    std::expected<std::int64_t, std::string> number;
+    if (option == "--record-segment") {
+        number = ParseIntegerInRange(option, value, kMinRecordSegmentSeconds, kMaxRecordSegmentSeconds);
+    } else if (option == "--record-retention") {
+        number = ParseIntegerInRange(option, value, kMinRecordSegmentSeconds, kMaxRecordRetentionSeconds);
+    } else if (option == "--record-sync") {
+        number = ParseIntegerInRange(option, value, 1, kMaxRecordSegmentSeconds);
+    } else {
+        number = ParseIntegerInRange(option, value, 0, kMaxRecordMinFreeMib);
+    }
+    if (!number) {
+        return std::unexpected(number.error());
+    }
+
+    if (option == "--record-segment") {
+        recording.segment_seconds = static_cast<int>(*number);
+    } else if (option == "--record-retention") {
+        recording.retention_seconds = static_cast<int>(*number);
+    } else if (option == "--record-sync") {
+        recording.sync_interval_seconds = static_cast<int>(*number);
+    } else {
+        recording.min_free_bytes = static_cast<std::uint64_t>(*number) * 1024 * 1024;
+    }
+    return {};
+}
+
+
+// 단위 시간에 따라 정해지는 녹화 인자 범위를 검사한다.
+//
+// recording: 모든 인자를 반영한 녹화 설정
+// 반환값: 성공하면 빈 값. 보관 분량이 단위 시간보다 작거나 동기화 주기가 단위 시간보다 크면 오류 메시지
+std::expected<void, std::string> CheckRecordingOptions(const RecordingOptions& recording) {
+    if (recording.retention_seconds < recording.segment_seconds) {
+        return std::unexpected(std::format("--record-retention({}초)은 --record-segment({}초) 이상이어야 합니다",
+                                           recording.retention_seconds, recording.segment_seconds));
+    }
+    if (recording.sync_interval_seconds > recording.segment_seconds) {
+        return std::unexpected(std::format("--record-sync({}초)는 --record-segment({}초) 이하여야 합니다",
+                                           recording.sync_interval_seconds, recording.segment_seconds));
+    }
+    return {};
+}
+
+
+// 카메라 이름을 녹화 폴더 이름으로 쓸 수 있는지 검사한다.
+//
+// name: 카메라 이름. 비어 있지 않은 UTF-8이다.
+// 반환값: 쓸 수 있으면 빈 값. '/'를 포함하거나, "." 또는 ".."이거나, 255바이트를 넘으면 오류 메시지
+std::expected<void, std::string> CheckCameraFolderName(std::string_view name) {
+    if (name.contains('/')) {
+        return std::unexpected(std::format("--camera의 카메라 이름에 '/'를 쓸 수 없습니다: {}", name));
+    }
+    if (name == "." || name == "..") {
+        return std::unexpected(std::format("--camera의 카메라 이름으로 '{}'를 쓸 수 없습니다", name));
+    }
+    if (name.size() > kMaxCameraNameBytes) {
+        return std::unexpected(
+            std::format("--camera의 카메라 이름이 {}바이트를 넘습니다 ({}바이트)", kMaxCameraNameBytes, name.size()));
+    }
+    return {};
+}
+
+
 // --camera 값을 카메라 이름과 URL로 나눈다.
 //
 // value: "<이름>=<URL>" 형식의 값
 // registered: 이미 등록한 카메라. 이름 중복 검사에 쓴다.
-// 반환값: 등록할 카메라. '='가 없거나, 이름이 비었거나 UTF-8이 아니거나 이미 있거나, URL이 잘못되었으면 오류 메시지
+// 반환값: 등록할 카메라. '='가 없거나, 이름이 비었거나 UTF-8이 아니거나 이미 있거나 폴더 이름으로 쓸 수 없거나,
+//   URL이 잘못되었으면 오류 메시지
 //
 // 첫 '='에서 나누므로 URL에는 '='가 들어가도 된다. 카메라 이름은 파일 동영상 이름과 겹쳐도 된다.
 std::expected<CameraOption, std::string> ParseCameraOption(std::string_view value,
@@ -153,6 +298,9 @@ std::expected<CameraOption, std::string> ParseCameraOption(std::string_view valu
     }
     if (!vms::core::IsValidUtf8(name)) {
         return std::unexpected("--camera의 카메라 이름이 UTF-8이 아닙니다");
+    }
+    if (auto checked = CheckCameraFolderName(name); !checked) {
+        return std::unexpected(checked.error());
     }
     if (std::ranges::any_of(registered, [name](const CameraOption& camera) { return camera.name == name; })) {
         return std::unexpected(std::format("--camera의 카메라 이름이 겹칩니다: {}", name));
@@ -170,8 +318,9 @@ std::expected<CameraOption, std::string> ParseCameraOption(std::string_view valu
 // arguments: 프로그램 이름을 제외한 인자 목록
 // 반환값: 해석 결과
 //   - 서버 설정: 생략한 항목은 기본값(포트 8080, 웹 루트 ./web, ICE 포트 50000, ICE 주소 자동,
-//     동영상 없음, 30fps, 카메라 없음)이다.
-//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도·카메라
+//     동영상 없음, 30fps, 카메라 없음, 녹화 디렉터리 recordings, 단위 60초, 보관 300초, 동기화 10초,
+//     최소 여유 공간 1024MiB)이다.
+//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도·카메라·녹화 인자
 //
 // --ice-address는 여러 번 쓸 수 있으며, 쓴 순서가 candidate 우선순위 순서가 된다. --camera도 여러 번 쓸 수 있으며,
 // 쓴 순서가 카메라 목록 순서가 된다. 카메라 호스트 이름은 여기서 해석하지 않는다.
@@ -183,7 +332,7 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
         const std::string_view option = arguments[index];
         if (option != "--port" && option != "--web-root" && option != "--ice-port" &&
             option != "--ice-address" && option != "--video-dir" && option != "--video-fps" &&
-            option != "--camera") {
+            option != "--camera" && !IsRecordingOption(option)) {
             return std::unexpected(std::format("알 수 없는 인자: {}", option));
         }
         if (index + 1 >= arguments.size()) {
@@ -199,6 +348,10 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             (option == "--port" ? options.http.port : options.ice_port) = *port;
         } else if (option == "--web-root") {
             options.http.web_root = value;
+        } else if (IsRecordingOption(option)) {
+            if (auto applied = ApplyRecordingOption(option, value, options.recording); !applied) {
+                return std::unexpected(applied.error());
+            }
         } else if (option == "--video-dir") {
             options.video_dir = fs::path(value);
         } else if (option == "--camera") {
@@ -220,6 +373,9 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             }
             options.ice_addresses.push_back(*address);
         }
+    }
+    if (auto checked = CheckRecordingOptions(options.recording); !checked) {
+        return std::unexpected(checked.error());
     }
     return options;
 }
@@ -264,6 +420,56 @@ std::expected<std::vector<in_addr>, std::string> ResolveIceAddresses(
         return std::unexpected("루프백이 아닌 IPv4 주소가 없습니다. --ice-address로 지정하세요");
     }
     return *std::move(addresses);
+}
+
+
+// 녹화 디렉터리에 남은 녹화를 복구하고, 등록한 카메라의 폴더를 준비한다.
+//
+// directory: 녹화 디렉터리의 절대 경로
+// camera_names: 등록한 카메라 이름. 비어 있으면 폴더를 만들지 않는다.
+// 반환값: 복구한 카메라 폴더별 닫힌 파일 목록. 녹화 디렉터리가 디렉터리가 아니거나, 복구 중 디렉터리를 훑을 수
+//   없거나, 카메라 폴더를 만들 수 없거나 쓸 수 없으면 오류 메시지
+//
+// 녹화 디렉터리가 있으면 카메라 유무와 관계없이 복구하고 결과를 카메라 폴더마다 로그에 남긴다. 녹화 스레드와 이벤트
+// 루프를 시작하기 전에 부른다.
+std::expected<RecordedFileCatalog, std::string> PrepareRecordingDirectory(const fs::path& directory,
+                                                                          const std::vector<std::string>& camera_names) {
+    RecordedFileCatalog recovered_files;
+    std::error_code error;
+    if (fs::exists(directory, error)) {
+        if (!fs::is_directory(directory, error)) {
+            return std::unexpected(std::format("녹화 디렉터리가 디렉터리가 아닙니다: {}", directory.string()));
+        }
+        auto recovered = vms::recording::RecoverRecordings(directory);
+        if (!recovered) {
+            return std::unexpected(recovered.error());
+        }
+        for (const auto& report : recovered->reports) {
+            if (report.truncated_count == 0 && report.deleted_count == 0 && report.failed_count == 0) {
+                std::println(stderr, "녹화 복구: {}, 남은 파일 {}개, 잘라 낸 데이터 없음", report.camera_folder,
+                             report.kept_count);
+            } else {
+                std::println(stderr, "녹화 복구: {}, 남은 파일 {}개, 잘라 낸 파일 {}개, 지운 파일 {}개, 실패 {}개",
+                             report.camera_folder, report.kept_count, report.truncated_count, report.deleted_count,
+                             report.failed_count);
+            }
+        }
+        recovered_files = std::move(recovered->files);
+    }
+
+    for (const std::string& camera_name : camera_names) {
+        const fs::path folder = directory / camera_name;
+        fs::create_directories(folder, error);
+        if (error) {
+            return std::unexpected(
+                std::format("카메라 녹화 폴더를 만들 수 없습니다 ({}): {}", folder.string(), error.message()));
+        }
+        if (::access(folder.c_str(), W_OK | X_OK) != 0) {
+            return std::unexpected(std::format("카메라 녹화 폴더에 쓸 수 없습니다 ({}): {}", folder.string(),
+                                               vms::core::LastSystemError().message()));
+        }
+    }
+    return recovered_files;
 }
 
 
@@ -329,6 +535,42 @@ int main(int argc, char* argv[]) {
     }
     if (!cameras.Entries().empty()) {
         std::println(stderr, "카메라 목록: {}대", cameras.Entries().size());
+    }
+
+    // 녹화 디렉터리는 복구가 끝난 뒤에만 녹화 스레드가 쓰도록, 복구와 폴더 준비를 스레드 시작 전에 마친다.
+    std::error_code absolute_error;
+    options->recording.directory = fs::absolute(options->recording.directory, absolute_error);
+    if (absolute_error) {
+        std::println(stderr, "녹화 디렉터리 경로 확인 실패: {}", absolute_error.message());
+        return 1;
+    }
+    std::vector<std::string> camera_names;
+    for (const auto& entry : cameras.Entries()) {
+        camera_names.push_back(entry->name);
+    }
+    auto recovered_files = PrepareRecordingDirectory(options->recording.directory, camera_names);
+    if (!recovered_files) {
+        std::println(stderr, "{}", recovered_files.error());
+        return 1;
+    }
+
+    // 녹화 상태가 작업 큐를 참조하므로 큐(녹화 스레드)를 먼저 선언해 나중에 소멸하게 한다. 녹화 상태는 카메라 소스를
+    // 구독하므로 카메라 목록보다 나중에 선언해 먼저 소멸하며, 소멸할 때 구독을 해지한다. 카메라 클라이언트의 Stop()이
+    // 루프를 멈추기 전에 끊김을 알리므로, 녹화 스레드가 소멸할 때 큐에는 마지막 닫기 작업까지 들어 있다.
+    // 카메라가 없으면 녹화 스레드를 시작하지 않아, 보관 삭제나 비상 삭제도 일어나지 않는다.
+    std::unique_ptr<RecordingWriter> recording_writer;
+    std::vector<std::unique_ptr<CameraRecorder>> camera_recorders;
+    if (!cameras.Entries().empty()) {
+        const RecordingOptions& recording = options->recording;
+        std::println(stderr, "녹화 설정: 디렉터리 {}, 단위 {}초, 보관 {}초, 동기화 {}초, 최소 여유 공간 {}MiB",
+                     recording.directory.string(), recording.segment_seconds, recording.retention_seconds,
+                     recording.sync_interval_seconds, recording.min_free_bytes / (1024 * 1024));
+        recording_writer = std::make_unique<RecordingWriter>(recording, *std::move(recovered_files));
+        for (const auto& entry : cameras.Entries()) {
+            camera_recorders.push_back(std::make_unique<CameraRecorder>(
+                entry->name, entry->source, recording.segment_seconds, *recording_writer,
+                [] { return std::chrono::system_clock::now(); }));
+        }
     }
 
     auto loop = EventLoop::Create();

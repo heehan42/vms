@@ -1,0 +1,8 @@
+add_unit_test(recording_file_name_test)
+add_unit_test(recording_index_test)
+add_unit_test(fmp4_test)
+add_unit_test(camera_recording_planner_test)
+add_unit_test(camera_recorder_test)
+add_unit_test(recording_file_store_test)
+add_unit_test(recording_writer_test)
+add_unit_test(recording_recovery_test)

@@ -13,6 +13,9 @@ add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic)
 # DTLS 데이터그램 처리에 3.2부터 들어간 datagram pair BIO를 쓰므로 3.2 이상이 필요하다.
 find_package(OpenSSL 3.2 REQUIRED)
 
+# 녹화 스레드(std::thread)에 필요한 스레드 라이브러리
+find_package(Threads REQUIRED)
+
 # 실행 파일과 테스트가 함께 링크하는 서버 구성 요소
 add_library(server_core STATIC
     src/core/event_loop.cpp
@@ -36,6 +39,14 @@ add_library(server_core STATIC
     src/media/h264_sps.cpp
     src/media/live_video_source.cpp
     src/media/video_library.cpp
+    src/recording/recording_file_name.cpp
+    src/recording/camera_recorder.cpp
+    src/recording/camera_recording_planner.cpp
+    src/recording/fmp4.cpp
+    src/recording/recording_index.cpp
+    src/recording/recording_file_store.cpp
+    src/recording/recording_recovery.cpp
+    src/recording/recording_writer.cpp
     src/rtsp/h264_rtp_depacketizer.cpp
     src/rtsp/rtsp_camera_client.cpp
     src/rtsp/rtsp_message.cpp
@@ -53,7 +64,7 @@ add_library(server_core STATIC
     src/webrtc/video_stream_sender.cpp
 )
 target_include_directories(server_core PUBLIC src)
-target_link_libraries(server_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(server_core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
 add_executable(vms_web_server src/apps/web_server/main.cpp)
 target_link_libraries(vms_web_server PRIVATE server_core)
