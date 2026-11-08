@@ -263,6 +263,35 @@ curl -s http://localhost:8080/api/sources
 
 이름에 한글이나 `&` 같은 문자가 있으면 값을 퍼센트 인코딩합니다(브라우저의 `encodeURIComponent`).
 
+### 정적 파일의 범위 요청
+
+서버는 파일 응답에서 `Range` 헤더의 범위 하나(`bytes=a-b`, `bytes=a-`, `bytes=-n`)를 처리합니다.
+서버를 실행한 상태에서 다음 명령으로 `app.js`의 처음 10바이트(0번부터 9번까지)를 요청합니다.
+
+```bash
+curl -r 0-9 -i http://localhost:8080/app.js
+```
+
+응답은 `206 Partial Content`이고, `Content-Range`의 `/` 뒤 숫자는 `app.js` 전체 크기(바이트)입니다.
+본문은 파일의 처음 10바이트라서 한글 글자 중간에서 끊길 수 있습니다.
+
+```text
+HTTP/1.1 206 Partial Content
+Content-Type: text/javascript; charset=utf-8
+Content-Length: 10
+Connection: close
+Accept-Ranges: bytes
+Content-Range: bytes 0-9/6746
+```
+
+| 요청 | 응답 |
+|---|---|
+| 범위 하나이고 시작 위치가 파일 크기보다 작음 | `206`과 그 범위의 바이트. 끝 위치가 파일 끝을 넘으면 파일 끝까지 |
+| 시작 위치가 파일 크기 이상, `bytes=-0` | `416 Range Not Satisfiable`, `Content-Range: bytes */<파일 크기>` |
+| 범위가 둘 이상, 형식 오류, `bytes`가 아닌 단위, `If-Range`가 함께 옴, `Range`가 여러 번 옴 | `Range`를 무시하고 파일 전체를 `200` |
+
+파일 내용을 담은 `200`과 `206` 응답에는 `Accept-Ranges: bytes`가 들어 있습니다.
+
 ## WSL2에서 실행하기
 
 WSL2 기본 네트워크 모드(NAT)에서 확인한 결과 별도 설정 없이 동작합니다.

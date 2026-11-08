@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -22,8 +23,11 @@ namespace vms::core {
 // fd 이벤트 외에 일회성 타이머도 제공한다. 반복이 필요하면 핸들러 안에서 다시 등록한다.
 // 루프는 등록된 fd를 소유하지 않는다. fd를 가진 객체가 등록을 해제한 뒤 fd를 닫아야 한다.
 // level-triggered 방식이므로 핸들러가 데이터를 다 읽지 않아도 다음 대기에서 다시 호출된다.
-// 핸들러는 Run()을 호출한 스레드에서만 실행되며, 루프의 메서드도 같은 스레드에서만 호출해야 한다.
-// 핸들러가 루프를 참조하므로 등록을 시작한 뒤에는 EventLoop 객체를 이동하면 안 된다.
+// 핸들러는 Run()을 호출한 스레드에서만 실행되며, 루프의 메서드도 Post()를 빼고는 같은 스레드에서만
+// 호출해야 한다. 핸들러가 루프를 참조하므로 등록을 시작한 뒤에는 EventLoop 객체를 이동하면 안 된다.
+//
+// Post()는 아무 스레드에서 호출할 수 있다. Post()를 부르는 스레드는 EventLoop가 소멸하기 전에
+// 끝나야 한다. 소멸한 루프의 Post()를 부르면 해제된 메모리에 접근한다.
 class EventLoop {
 public:
     // fd에 이벤트가 발생했을 때 호출되는 핸들러.
@@ -40,10 +44,26 @@ public:
     using TimerHandler = std::move_only_function<void()>;
 
 
-    // epoll 인스턴스를 만들어 이벤트 루프를 생성한다.
+    // 다른 스레드가 Post()로 넘겨 루프 스레드에서 실행되는 루프 작업.
+    using PostedTask = std::move_only_function<void()>;
+
+
+    // epoll 인스턴스와 루프 작업 알림용 eventfd를 만들어 이벤트 루프를 생성한다.
     //
-    // 반환값: 생성된 이벤트 루프. epoll 생성에 실패하면 시스템 오류 코드
+    // 반환값: 생성된 이벤트 루프. epoll이나 eventfd 생성·등록에 실패하면 시스템 오류 코드
     static std::expected<EventLoop, std::error_code> Create();
+
+
+    // 루프 스레드에서 실행할 루프 작업을 넘긴다. 아무 스레드에서나 호출할 수 있다.
+    //
+    // task: 루프 스레드에서 한 번 실행할 함수 객체
+    //
+    // 호출한 스레드는 작업을 목록에 넣고 바로 돌아간다. 루프 스레드는 eventfd 이벤트를 처리할 때
+    // 목록의 루프 작업을 넣은 순서대로 실행한다. 다른 fd 핸들러·타이머와의 실행 순서는 보장하지 않는다.
+    // 루프 작업 안에서 넘긴 루프 작업은 다음 반복에서 실행된다.
+    // Run()이 반환된 뒤 들어왔거나 실행되지 않은 루프 작업은 EventLoop가 소멸할 때 실행 없이 파괴된다.
+    // 루프 작업이 캡처한 객체는 루프 스레드에서 파괴될 수도, 소멸 시점의 스레드에서 파괴될 수도 있다.
+    void Post(PostedTask task);
 
 
     // fd를 감시 대상으로 등록한다.
@@ -122,14 +142,42 @@ private:
     };
 
 
+    // 다른 스레드가 Post()로 넘긴 루프 작업 목록과, 루프 스레드를 깨우는 eventfd.
+    //
+    // std::mutex는 이동할 수 없고 eventfd 핸들러가 이 객체의 주소를 캡처하므로, EventLoop가
+    // 이동해도 주소가 바뀌지 않도록 힙에 두고 EventLoop가 std::unique_ptr로 소유한다.
+    struct PostedTaskQueue {
+        // 루프 작업이 들어왔음을 루프 스레드에 알리는 eventfd. epoll에 EPOLLIN으로 등록되어 있다.
+        UniqueFd event_fd;
+
+
+        // tasks를 보호하는 잠금
+        std::mutex mutex;
+
+
+        // 아직 실행하지 않은 루프 작업. 넣은 순서대로 실행한다. mutex를 잡고 읽고 쓴다.
+        std::vector<PostedTask> tasks;
+    };
+
+
     // 타이머 테이블의 정렬 키. 기한이 같으면 ID가 작은(먼저 등록한) 타이머가 앞선다.
     using TimerKey = std::pair<std::chrono::steady_clock::time_point, TimerId>;
 
 
-    // 생성된 epoll 인스턴스로 루프를 만든다. Create()에서만 호출한다.
+    // 생성된 epoll 인스턴스와 루프 작업 목록으로 루프를 만든다. Create()에서만 호출한다.
     //
     // epoll_fd: 소유권을 넘겨받을 epoll 인스턴스
-    explicit EventLoop(UniqueFd epoll_fd);
+    // posted_task_queue: 소유권을 넘겨받을 루프 작업 목록. eventfd는 아직 epoll에 등록하지 않은 상태다.
+    EventLoop(UniqueFd epoll_fd, std::unique_ptr<PostedTaskQueue> posted_task_queue);
+
+
+    // eventfd를 읽어 알림을 지우고, 그때까지 들어온 루프 작업을 넣은 순서대로 실행한다.
+    //
+    // queue: 루프 작업 목록. 루프 스레드에서만 호출한다.
+    //
+    // 잠금을 잡은 채 목록을 지역 변수와 맞바꾸고 잠금을 푼 뒤 실행하므로, 루프 작업 안에서
+    // Post()를 불러도 교착되지 않는다.
+    static void RunPostedTasks(PostedTaskQueue& queue);
 
 
     // 가장 이른 타이머 기한까지 남은 시간을 epoll_wait의 대기 시간으로 바꾼다.
@@ -174,6 +222,10 @@ private:
 
     // Stop()이 호출되어 Run()이 현재 이벤트 묶음 뒤에 반환해야 하는지 여부
     bool is_stop_requested_ = false;
+
+
+    // 다른 스레드가 Post()로 넘긴 루프 작업 목록. 이동된 뒤의 빈 객체에서는 nullptr이다.
+    std::unique_ptr<PostedTaskQueue> posted_task_queue_;
 };
 
 

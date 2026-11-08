@@ -28,6 +28,8 @@ add_library(server_core STATIC
     src/crypto/openssl_error.cpp
     src/crypto/random.cpp
     src/crypto/srtp.cpp
+    src/http/byte_range.cpp
+    src/http/file_reader.cpp
     src/http/http_request.cpp
     src/http/http_response.cpp
     src/http/http_server.cpp

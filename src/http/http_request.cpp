@@ -154,6 +154,16 @@ bool RecordUsedHeader(const HeaderField& field, HttpRequest& request) {
         request.content_type = std::string(field.value);
     } else if (core::EqualsIgnoringAsciiCase(field.name, "Transfer-Encoding")) {
         request.has_transfer_encoding = true;
+    } else if (core::EqualsIgnoringAsciiCase(field.name, "Range")) {
+        // 범위를 둘 이상 요청한 것과 같으므로 어느 값도 쓰지 않는다.
+        if (request.range || request.is_range_repeated) {
+            request.range.reset();
+            request.is_range_repeated = true;
+        } else {
+            request.range = std::string(field.value);
+        }
+    } else if (core::EqualsIgnoringAsciiCase(field.name, "If-Range")) {
+        request.has_if_range = true;
     }
     return true;
 }

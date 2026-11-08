@@ -9,7 +9,6 @@
 #include "test_support.h"
 
 using vms::http::HttpStatus;
-using vms::http::ReadFileContent;
 using vms::http::ResolveStaticFilePath;
 using vms::test::Expect;
 
@@ -55,7 +54,24 @@ void TestResolvesFiles(const fs::path& web_root) {
 }
 
 
-// 잘못된 대상, 상위 경로, 없는 파일, 디렉터리를 알맞은 상태 코드로 거부하는지 검사한다.
+// 파일 시스템을 조회하지 않으므로 없는 파일과 디렉터리도 경로를 돌려주는지 검사한다.
+//
+// web_root: 테스트용 파일을 만들어 둔 임시 웹 루트
+void TestResolvesWithoutFileSystemLookup(const fs::path& web_root) {
+    const auto missing = ResolveStaticFilePath(web_root, "/missing.js");
+    Expect(missing && *missing == web_root / "missing.js", "없는 파일도 경로를 돌려주어야 한다");
+
+    const auto directory = ResolveStaticFilePath(web_root, "/assets/");
+    Expect(directory && *directory == web_root / "assets", "디렉터리도 경로를 돌려주어야 한다");
+
+    // 구성 요소를 하나씩 붙이므로 빈 구성 요소 뒤의 경로가 웹 루트를 대체하지 않는다.
+    const auto double_slash = ResolveStaticFilePath(web_root, "//etc/passwd");
+    Expect(double_slash && *double_slash == web_root / "etc" / "passwd",
+           "빈 구성 요소 뒤의 경로가 웹 루트 밖의 절대 경로가 되면 안 된다");
+}
+
+
+// 잘못된 대상과 상위 경로를 알맞은 상태 코드로 거부하는지 검사한다.
 //
 // web_root: 테스트용 파일을 만들어 둔 임시 웹 루트
 void TestRejectsInvalidTargets(const fs::path& web_root) {
@@ -63,22 +79,6 @@ void TestRejectsInvalidTargets(const fs::path& web_root) {
     Expect(FailsWith(web_root, "/../etc/passwd", HttpStatus::kForbidden), "상위 경로는 403");
     Expect(FailsWith(web_root, "/assets/../app.js", HttpStatus::kForbidden),
            "중간의 ..도 403");
-    Expect(FailsWith(web_root, "/missing.js", HttpStatus::kNotFound), "없는 파일은 404");
-    Expect(FailsWith(web_root, "/assets", HttpStatus::kNotFound), "디렉터리는 404");
-    Expect(FailsWith(web_root, "/assets/", HttpStatus::kNotFound), "/로 끝나는 디렉터리도 404");
-    Expect(FailsWith(web_root, "//etc/passwd", HttpStatus::kNotFound),
-           "빈 구성 요소 뒤의 경로가 웹 루트 밖의 절대 경로가 되면 안 된다");
-}
-
-
-// 파일 내용 전체를 읽고, 없는 파일은 오류로 돌려주는지 검사한다.
-//
-// web_root: 테스트용 파일을 만들어 둔 임시 웹 루트
-void TestReadsFileContent(const fs::path& web_root) {
-    const auto content = ReadFileContent(web_root / "app.js");
-    Expect(content && *content == "console.log('app');", "파일 내용 전체를 읽어야 한다");
-
-    Expect(!ReadFileContent(web_root / "missing.js"), "없는 파일 읽기는 오류여야 한다");
 }
 
 
@@ -100,8 +100,8 @@ int main() {
     WriteFile(web_root / "assets" / "style.css", "body {}");
 
     TestResolvesFiles(web_root);
+    TestResolvesWithoutFileSystemLookup(web_root);
     TestRejectsInvalidTargets(web_root);
-    TestReadsFileContent(web_root);
 
     fs::remove_all(web_root, error);
     return vms::test::ExitCode();

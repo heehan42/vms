@@ -14,6 +14,8 @@ std::string_view ReasonPhrase(HttpStatus status) {
     switch (status) {
         case HttpStatus::kOk:
             return "OK";
+        case HttpStatus::kPartialContent:
+            return "Partial Content";
         case HttpStatus::kBadRequest:
             return "Bad Request";
         case HttpStatus::kForbidden:
@@ -28,6 +30,8 @@ std::string_view ReasonPhrase(HttpStatus status) {
             return "Content Too Large";
         case HttpStatus::kUnsupportedMediaType:
             return "Unsupported Media Type";
+        case HttpStatus::kRangeNotSatisfiable:
+            return "Range Not Satisfiable";
         case HttpStatus::kInternalServerError:
             return "Internal Server Error";
         case HttpStatus::kNotImplemented:

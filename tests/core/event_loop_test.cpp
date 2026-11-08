@@ -6,7 +6,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/unique_fd.h"
@@ -280,6 +283,105 @@ void TestTimersAndFdEventsTogether() {
 }
 
 
+// 다른 스레드에서 넘긴 루프 작업이 Run()을 호출한 스레드에서 실행되는지 검사한다.
+//
+// 루프에 fd 이벤트도 타이머도 없고, 다른 스레드는 루프가 대기에 들어간 뒤 넘기도록 잠시 기다린다.
+// Post가 대기 중인 루프를 깨우지 못하면 Run()이 반환되지 않는다.
+void TestPostedTaskRunsOnLoopThread() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+
+    std::optional<std::thread::id> task_thread_id;
+    std::thread posting_thread([&] {
+        std::this_thread::sleep_for(20ms);
+        loop->Post([&] {
+            task_thread_id = std::this_thread::get_id();
+            loop->Stop();
+        });
+    });
+
+    Expect(!loop->Run(), "Stop 후 Run이 오류 없이 반환되어야 한다");
+    posting_thread.join();
+    Expect(task_thread_id == std::this_thread::get_id(), "루프 작업은 Run()을 호출한 스레드에서 실행되어야 한다");
+}
+
+
+// 한 스레드가 넘긴 여러 루프 작업이 넘긴 순서대로 실행되는지 검사한다.
+void TestPostedTasksRunInOrder() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+
+    constexpr int kTaskCount = 1000;
+    std::vector<int> run_order;
+    std::thread posting_thread([&] {
+        for (int index = 0; index < kTaskCount; ++index) {
+            loop->Post([&run_order, index] { run_order.push_back(index); });
+        }
+        loop->Post([&] { loop->Stop(); });
+    });
+
+    loop->Run();
+    posting_thread.join();
+    bool is_in_order = run_order.size() == kTaskCount;
+    for (int index = 0; is_in_order && index < kTaskCount; ++index) {
+        is_in_order = run_order[index] == index;
+    }
+    Expect(is_in_order, "루프 작업은 넘긴 순서대로 모두 실행되어야 한다");
+}
+
+
+// 루프 작업 안에서 넘긴 루프 작업도 실행되는지 검사한다.
+void TestTaskPostedFromTaskRuns() {
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+
+    std::vector<std::string> run_order;
+    loop->Post([&] {
+        run_order.push_back("outer");
+        loop->Post([&] {
+            run_order.push_back("inner");
+            loop->Stop();
+        });
+    });
+
+    loop->Run();
+    Expect(run_order == std::vector<std::string>{"outer", "inner"},
+           "루프 작업 안에서 넘긴 루프 작업도 실행되어야 한다");
+}
+
+
+// Create()로 만든 루프를 다른 객체로 이동한 뒤에도 Post가 동작하는지 검사한다.
+void TestPostWorksAfterMove() {
+    auto created = EventLoop::Create();
+    if (!created) {
+        Expect(false, "이벤트 루프 생성");
+        return;
+    }
+    EventLoop loop = std::move(*created);
+
+    bool is_task_run = false;
+    std::thread posting_thread([&] {
+        loop.Post([&] {
+            is_task_run = true;
+            loop.Stop();
+        });
+    });
+
+    loop.Run();
+    posting_thread.join();
+    Expect(is_task_run, "이동한 루프에서도 넘긴 루프 작업이 실행되어야 한다");
+}
+
+
 }  // namespace
 
 
@@ -293,5 +395,9 @@ int main() {
     TestCancelledTimerDoesNotRun();
     TestTimerHandlerCanCancelSelfAndAddTimer();
     TestTimersAndFdEventsTogether();
+    TestPostedTaskRunsOnLoopThread();
+    TestPostedTasksRunInOrder();
+    TestTaskPostedFromTaskRuns();
+    TestPostWorksAfterMove();
     return vms::test::ExitCode();
 }

@@ -1,14 +1,6 @@
 #include "http/static_files.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include <array>
-#include <cerrno>
 #include <ranges>
-
-#include "core/system_error.h"
-#include "core/unique_fd.h"
 
 
 namespace vms::http {
@@ -37,37 +29,7 @@ std::expected<std::filesystem::path, HttpStatus> ResolveStaticFilePath(
         }
     }
 
-    std::error_code status_error;
-    const std::filesystem::file_status file_status =
-        std::filesystem::status(file_path, status_error);
-    if (status_error || !std::filesystem::is_regular_file(file_status)) {
-        return std::unexpected(HttpStatus::kNotFound);
-    }
     return file_path;
-}
-
-
-std::expected<std::string, std::error_code> ReadFileContent(const std::filesystem::path& path) {
-    const core::UniqueFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (!file.IsValid()) {
-        return std::unexpected(core::LastSystemError());
-    }
-
-    std::string content;
-    std::array<char, 16 * 1024> chunk;
-    while (true) {
-        const ssize_t read_size = ::read(file.Get(), chunk.data(), chunk.size());
-        if (read_size < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return std::unexpected(core::LastSystemError());
-        }
-        if (read_size == 0) {
-            return content;
-        }
-        content.append(chunk.data(), static_cast<std::size_t>(read_size));
-    }
 }
 
 

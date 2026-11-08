@@ -41,6 +41,20 @@ struct HttpRequest {
 
     // Transfer-Encoding 헤더가 있었는지 여부. 서버는 chunked 등 전송 인코딩을 지원하지 않는다.
     bool has_transfer_encoding = false;
+
+
+    // Range 헤더의 값. 앞뒤 공백을 뺀 원문이다.
+    //
+    // 헤더가 없거나 여러 번 왔으면 빈 optional이다. 여러 번 왔는지는 is_range_repeated로 구분한다.
+    std::optional<std::string> range;
+
+
+    // Range 헤더가 두 번 이상 왔는지 여부. true이면 range는 빈 optional이며, 서버는 범위를 무시한다.
+    bool is_range_repeated = false;
+
+
+    // If-Range 헤더가 있었는지 여부. 서버는 ETag와 Last-Modified를 보내지 않으므로 값은 쓰지 않는다.
+    bool has_if_range = false;
 };
 
 
@@ -65,6 +79,7 @@ std::expected<std::optional<std::size_t>, HttpStatus> FindRequestHeaderEnd(
 //
 // 요청 줄은 "메서드 SP 대상 SP HTTP/1.x" 형식만, 헤더 줄은 "이름: 값" 형식만 허용한다.
 // 헤더 이름은 대소문자를 구분하지 않는다. Content-Type이 여러 번 오면 마지막 값을 쓴다.
+// Range가 여러 번 오면 값을 보관하지 않고 is_range_repeated만 표시한다.
 // 메서드를 지원하는지와 본문 크기 한도는 판단하지 않으며, 라우팅 단계에서 결정한다.
 std::expected<HttpRequest, HttpStatus> ParseRequestHeader(std::string_view header);
 

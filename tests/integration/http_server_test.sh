@@ -98,6 +98,18 @@ expect_equal "쿼리 문자열 무시" "200" "$(status_of '/app.js?v=1')"
 expect_equal "JS Content-Type" "text/javascript; charset=utf-8" "$(header_of /app.js Content-Type)"
 expect_equal "알 수 없는 확장자" "application/octet-stream" "$(header_of /data.bin Content-Type)"
 
+# 정적 파일의 범위 요청. app.js의 크기를 기준으로 범위를 정한다.
+app_size="$(wc -c < "${web_root}/app.js")"
+expect_equal "파일 응답의 Accept-Ranges" "bytes" "$(header_of /app.js Accept-Ranges)"
+expect_equal "범위 요청 상태" "206" "$(status_of /app.js -r 0-9)"
+expect_equal "범위 요청으로 받은 바이트 수" "10" "$(curl -s -r 0-9 "${base_url}/app.js" | wc -c)"
+expect_equal "범위 요청 Content-Range" "bytes 0-9/${app_size}" \
+    "$(curl -s -D - -o /dev/null -r 0-9 "${base_url}/app.js" | tr -d '\r' | grep -i '^Content-Range:' | cut -d ' ' -f 2-)"
+expect_equal "파일 크기 이상의 시작 위치" "416" "$(status_of /app.js -H "Range: bytes=${app_size}-")"
+expect_equal "여러 범위는 무시" "200" "$(status_of /app.js -H 'Range: bytes=0-1,4-5')"
+expect_equal "여러 범위에서 받은 바이트 수" "${app_size}" \
+    "$(curl -s -H 'Range: bytes=0-1,4-5' "${base_url}/app.js" | wc -c)"
+
 # 요청 오류와 파일 접근 제한
 expect_equal "잘못된 요청 줄" "400" "$(printf 'HELLO\r\n\r\n' | raw_status)"
 long_header="$(head -c 9000 /dev/zero | tr '\0' 'a')"

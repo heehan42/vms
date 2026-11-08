@@ -1,10 +1,16 @@
 #include "core/event_loop.h"
 
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <print>
 #include <utility>
 
 #include "core/system_error.h"
@@ -18,11 +24,65 @@ std::expected<EventLoop, std::error_code> EventLoop::Create() {
     if (!epoll_fd.IsValid()) {
         return std::unexpected(LastSystemError());
     }
-    return EventLoop(std::move(epoll_fd));
+
+    auto posted_task_queue = std::make_unique<PostedTaskQueue>();
+    posted_task_queue->event_fd.Reset(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+    if (!posted_task_queue->event_fd.IsValid()) {
+        return std::unexpected(LastSystemError());
+    }
+
+    // 핸들러는 힙에 있는 루프 작업 목록의 주소만 캡처하므로, 반환하면서 루프가 이동해도 유효하다.
+    PostedTaskQueue& queue = *posted_task_queue;
+    EventLoop loop(std::move(epoll_fd), std::move(posted_task_queue));
+    const std::error_code error =
+        loop.Add(queue.event_fd.Get(), EPOLLIN, [&queue](std::uint32_t) { RunPostedTasks(queue); });
+    if (error) {
+        return std::unexpected(error);
+    }
+    return loop;
 }
 
 
-EventLoop::EventLoop(UniqueFd epoll_fd) : epoll_fd_(std::move(epoll_fd)) {}
+EventLoop::EventLoop(UniqueFd epoll_fd, std::unique_ptr<PostedTaskQueue> posted_task_queue)
+    : epoll_fd_(std::move(epoll_fd)), posted_task_queue_(std::move(posted_task_queue)) {}
+
+
+void EventLoop::Post(PostedTask task) {
+    PostedTaskQueue& queue = *posted_task_queue_;
+    std::lock_guard lock(queue.mutex);
+    const bool was_empty = queue.tasks.empty();
+    queue.tasks.push_back(std::move(task));
+
+    // 목록이 비어 있지 않았다면 이미 eventfd에 알림이 있거나, 루프 스레드가 목록을 맞바꾸기 전이라
+    // 이번 작업도 함께 실행된다. 처음 채워질 때만 알려 eventfd 쓰기를 줄인다.
+    if (!was_empty) {
+        return;
+    }
+    const std::uint64_t increment = 1;
+    if (::write(queue.event_fd.Get(), &increment, sizeof(increment)) < 0 && errno != EAGAIN) {
+        // 카운터 넘침(EAGAIN)은 처음 채워질 때만 쓰므로 일어나지 않는다. 그 밖의 실패는 루프 작업이
+        // 영영 실행되지 않는 상태이므로 계속 진행하지 않는다.
+        std::println(stderr, "event loop: eventfd write failed: {}", std::strerror(errno));
+        std::abort();
+    }
+}
+
+
+void EventLoop::RunPostedTasks(PostedTaskQueue& queue) {
+    // 목록을 맞바꾸기 전에 알림을 지운다. 순서를 바꾸면 그 사이에 들어온 알림을 지워 루프 작업이
+    // 실행되지 않고 남는다.
+    std::uint64_t counter = 0;
+    [[maybe_unused]] const ssize_t read_size = ::read(queue.event_fd.Get(), &counter, sizeof(counter));
+
+    std::vector<PostedTask> tasks;
+    {
+        std::lock_guard lock(queue.mutex);
+        tasks.swap(queue.tasks);
+    }
+    for (PostedTask& task : tasks) {
+        task();
+    }
+}
 
 
 std::error_code EventLoop::Add(int fd, std::uint32_t events, Handler handler) {

@@ -28,6 +28,16 @@ void TestBuildsOkResponse() {
 }
 
 
+// 206 응답의 상태 줄을 만들고 숫자값이 206인지 검사한다.
+void TestBuildsPartialContentStatusLine() {
+    Expect(vms::http::StatusCodeNumber(HttpStatus::kPartialContent) == 206, "206 숫자값");
+    Expect(vms::http::StatusCodeNumber(HttpStatus::kRangeNotSatisfiable) == 416, "416 숫자값");
+    Expect(BuildResponse(HttpStatus::kPartialContent, "application/octet-stream", "x")
+               .starts_with("HTTP/1.1 206 Partial Content\r\n"),
+           "206 상태 줄");
+}
+
+
 // 오류 응답에 추가 헤더와 상태 문구 본문을 넣는지 검사한다.
 void TestBuildsErrorResponseWithExtraHeader() {
     const std::array extra_headers = {HttpHeader{"Allow", "GET"}};
@@ -64,6 +74,9 @@ void TestBuildsEachErrorStatusLine() {
     Expect(BuildErrorResponse(HttpStatus::kUnsupportedMediaType)
                .starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"),
            "415 상태 줄");
+    Expect(BuildErrorResponse(HttpStatus::kRangeNotSatisfiable)
+               .starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+           "416 상태 줄");
     Expect(BuildErrorResponse(HttpStatus::kNotImplemented)
                .starts_with("HTTP/1.1 501 Not Implemented\r\n"),
            "501 상태 줄");
@@ -75,6 +88,7 @@ void TestBuildsEachErrorStatusLine() {
 
 int main() {
     TestBuildsOkResponse();
+    TestBuildsPartialContentStatusLine();
     TestBuildsErrorResponseWithExtraHeader();
     TestBuildsEachErrorStatusLine();
     return vms::test::ExitCode();

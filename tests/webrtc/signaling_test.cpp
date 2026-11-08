@@ -73,11 +73,11 @@ std::string ReadFile(const fs::path& path) {
 // 반환값: 응답 상태 코드
 HttpStatus PostOffer(Signaling& signaling, std::string_view target, std::string_view offer,
                      std::string_view content_type = "application/sdp") {
-    const HttpRequest request{.method = "POST",
-                              .target = std::string(target),
-                              .content_length = offer.size(),
-                              .content_type = std::string(content_type),
-                              .has_transfer_encoding = false};
+    HttpRequest request;
+    request.method = "POST";
+    request.target = std::string(target);
+    request.content_length = offer.size();
+    request.content_type = std::string(content_type);
     return signaling.HandleOffer(request, offer).status;
 }
 

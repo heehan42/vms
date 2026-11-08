@@ -15,6 +15,9 @@ enum class HttpStatus {
     // 요청한 파일을 응답함
     kOk = 200,
 
+    // Range 헤더가 요청한 파일의 일부 바이트를 응답함
+    kPartialContent = 206,
+
     // 요청 줄이나 헤더 형식이 잘못되었거나 헤더 영역이 너무 큼
     kBadRequest = 400,
 
@@ -35,6 +38,9 @@ enum class HttpStatus {
 
     // 엔드포인트가 받지 않는 본문 형식(Content-Type)
     kUnsupportedMediaType = 415,
+
+    // Range 헤더가 요청한 범위가 파일 안에 한 바이트도 없음
+    kRangeNotSatisfiable = 416,
 
     // 확인한 파일을 읽지 못했거나 엔드포인트 처리 중 내부 오류
     kInternalServerError = 500,

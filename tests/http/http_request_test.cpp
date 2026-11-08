@@ -144,6 +144,37 @@ void TestRejectsInvalidContentLength() {
 }
 
 
+// Range 값과 If-Range 유무를 보관하고, 헤더가 없으면 비워 두는지 검사한다.
+void TestRecordsRangeHeaders() {
+    const auto request =
+        ParseRequestHeader("GET /a.bin HTTP/1.1\r\nrange:  bytes=0-9 \r\nIf-Range: \"x\"\r\n\r\n");
+    if (!request) {
+        Expect(false, "Range 헤더가 있는 요청 파싱");
+        return;
+    }
+    Expect(request->range == "bytes=0-9", "앞뒤 공백을 뺀 Range 값");
+    Expect(!request->is_range_repeated, "한 번 온 Range는 반복 표시가 없어야 한다");
+    Expect(request->has_if_range, "If-Range 유무");
+
+    const auto without_range = ParseRequestHeader("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    Expect(without_range && !without_range->range && !without_range->is_range_repeated &&
+               !without_range->has_if_range,
+           "Range와 If-Range가 없으면 비워 두어야 한다");
+}
+
+
+// Range가 여러 번 오면 값을 비우고 반복을 표시하는지 검사한다.
+void TestMarksRepeatedRange() {
+    const auto twice = ParseRequestHeader(
+        "GET /a.bin HTTP/1.1\r\nRange: bytes=0-9\r\nRange: bytes=0-9\r\n\r\n");
+    Expect(twice && !twice->range && twice->is_range_repeated, "두 번 온 Range");
+
+    const auto three_times = ParseRequestHeader(
+        "GET /a.bin HTTP/1.1\r\nRange: bytes=0-9\r\nRange: bytes=1-2\r\nRange: bytes=3-4\r\n\r\n");
+    Expect(three_times && !three_times->range && three_times->is_range_repeated, "세 번 온 Range");
+}
+
+
 }  // namespace
 
 
@@ -158,5 +189,7 @@ int main() {
     TestRecordsBodyHeaders();
     TestLeavesMissingBodyHeadersEmpty();
     TestRejectsInvalidContentLength();
+    TestRecordsRangeHeaders();
+    TestMarksRepeatedRange();
     return vms::test::ExitCode();
 }
