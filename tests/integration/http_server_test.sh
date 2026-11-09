@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# vms_web_server를 임시 웹 루트로 실행하고 http-server, webrtc-signaling 명세의 시나리오를
-# 실제 요청으로 검사한다.
+# vms_web_server를 임시 웹 루트로 실행하고 http-server, webrtc-signaling, video-catalog, recording-playback
+# 명세의 시나리오를 실제 요청으로 검사한다.
 #
 # 사용법: http_server_test.sh <vms_web_server 실행 파일 경로> <Chrome offer 견본 경로>
+#                             <make_test_recording 실행 파일 경로>
 # HTTP 포트는 HTTP_SERVER_TEST_PORT(기본 18080), ICE UDP 포트는 ICE_TEST_PORT(기본 18090)
 # 환경 변수로 바꿀 수 있다.
 
@@ -10,6 +11,7 @@ set -u
 
 server_binary="$1"
 chrome_offer="$2"
+make_test_recording="$3"
 port="${HTTP_SERVER_TEST_PORT:-18080}"
 ice_port="${ICE_TEST_PORT:-18090}"
 base_url="http://localhost:${port}"
@@ -19,6 +21,8 @@ web_root="${work_dir}/web"
 # 카메라를 등록하는 실행이 실행 위치에 recordings/를 만들지 않도록 임시 녹화 디렉터리를 쓴다.
 record_dir="${work_dir}/recordings"
 no_camera_record_dir="${work_dir}/no_camera_recordings"
+# 녹화 재생 시나리오에서 make_test_recording으로 녹화 파일을 미리 만들어 두는 녹화 디렉터리
+playback_record_dir="${work_dir}/playback_recordings"
 server_log="${work_dir}/server.log"
 server_pid=""
 failure_count=0
@@ -381,6 +385,63 @@ if [[ -d "${record_dir}/정문" ]]; then
 else
     expect_equal "한글 이름의 녹화 폴더" "있음" "없음"
 fi
+kill -TERM "${server_pid}"
+wait "${server_pid}"
+server_pid=""
+
+# 녹화 재생: 녹화 디렉터리에 남은 닫힌 파일을 카메라 등록 없이 재생 목록과 녹화 파일로 제공한다.
+# front 폴더에는 2026-11-08 09:00:00Z와 09:20:00Z에 시작하는 파일 두 개(조각 3개씩), back 폴더에는 파일 하나를 만든다.
+"${make_test_recording}" "${playback_record_dir}" front 1794128400000 3
+"${make_test_recording}" "${playback_record_dir}" front 1794129600000 3
+"${make_test_recording}" "${playback_record_dir}" back 1794128400000 2
+mkdir -p "${playback_record_dir}/empty"
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1 --ice-port "${ice_port}" --record-dir "${playback_record_dir}" 2>> "${server_log}" &
+server_pid=$!
+for _ in $(seq 50); do
+    if curl -s -o /dev/null "${base_url}/"; then
+        break
+    fi
+    sleep 0.1
+done
+expect_equal "녹화 폴더의 소스 목록" \
+    '{"sources":[{"type":"recording","name":"back"},{"type":"recording","name":"front"}]}' \
+    "$(curl -s "${base_url}/api/sources")"
+
+playlist_path='/api/recordings/playlist.m3u8?camera=front'
+expect_equal "재생 목록 상태" "200" "$(status_of "${playlist_path}")"
+expect_equal "재생 목록 Content-Type" "application/vnd.apple.mpegurl" "$(header_of "${playlist_path}" Content-Type)"
+playlist="$(curl -s "${base_url}${playlist_path}")"
+expect_equal "재생 목록 첫 줄" "#EXTM3U" "$(head -n 1 <<< "${playlist}")"
+expect_equal "재생 목록의 세그먼트 수" "6" "$(grep -c '^#EXTINF:1.000,$' <<< "${playlist}")"
+expect_equal "재생 목록의 파일 경계" "1" "$(grep -c '^#EXT-X-DISCONTINUITY$' <<< "${playlist}")"
+expect_equal "두 번째 파일의 시작 시각" "1" \
+    "$(grep -c '^#EXT-X-PROGRAM-DATE-TIME:2026-11-08T09:20:00.000Z$' <<< "${playlist}")"
+
+# 재생 목록의 첫 세그먼트대로 Range 요청을 보낸다. #EXT-X-BYTERANGE:<크기>@<시작 위치> 다음 줄이 URL이다.
+first_byterange="$(grep -m 1 '^#EXT-X-BYTERANGE:' <<< "${playlist}" | cut -d ':' -f 2)"
+first_segment_url="$(grep -m 1 -A 1 '^#EXT-X-BYTERANGE:' <<< "${playlist}" | tail -n 1)"
+segment_size="${first_byterange%@*}"
+segment_offset="${first_byterange#*@}"
+segment_range="${segment_offset}-$((segment_offset + segment_size - 1))"
+expect_equal "세그먼트 범위 요청 상태" "206" "$(status_of "${first_segment_url}" -r "${segment_range}")"
+expect_equal "세그먼트 범위 요청 Content-Type" "video/mp4" \
+    "$(curl -s -D - -o /dev/null -r "${segment_range}" "${base_url}${first_segment_url}" |
+        tr -d '\r' | grep -i '^Content-Type:' | cut -d ' ' -f 2-)"
+expect_equal "세그먼트 범위 요청으로 받은 바이트 수" "${segment_size}" \
+    "$(curl -s -r "${segment_range}" "${base_url}${first_segment_url}" | wc -c)"
+expect_equal "세그먼트는 moof로 시작" "moof" \
+    "$(curl -s -r "${segment_range}" "${base_url}${first_segment_url}" | head -c 8 | tail -c 4)"
+
+expect_equal "없는 녹화 파일" "404" "$(status_of '/api/recordings/file.mp4?camera=front&file=20261108T091000Z')"
+expect_equal "경로처럼 보이는 녹화 파일 값" "404" \
+    "$(status_of '/api/recordings/file.mp4?camera=..&file=..%2F..%2Fetc%2Fpasswd')"
+expect_equal "file 없는 녹화 파일 요청" "400" "$(status_of '/api/recordings/file.mp4?camera=front')"
+expect_equal "camera 없는 재생 목록 요청" "400" "$(status_of /api/recordings/playlist.m3u8)"
+expect_equal "없는 폴더의 재생 목록" "404" "$(status_of '/api/recordings/playlist.m3u8?camera=missing')"
+expect_equal "파일 없는 폴더의 재생 목록" "404" "$(status_of '/api/recordings/playlist.m3u8?camera=empty')"
+expect_equal "type=recording offer" "400" \
+    "$(status_of '/offer?type=recording&name=front' --data-binary "@${chrome_offer}" "${sdp_header[@]}")"
 kill -TERM "${server_pid}"
 wait "${server_pid}"
 server_pid=""

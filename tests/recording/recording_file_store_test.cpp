@@ -2,9 +2,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <filesystem>
 #include <limits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 #include "recording/recording_file_name.h"
 #include "recording_test_support.h"
@@ -14,9 +18,14 @@ namespace fs = std::filesystem;
 
 using vms::recording::FormatRecordingFileStem;
 using vms::recording::RecordedFile;
+using vms::recording::RecordedFileClosed;
+using vms::recording::RecordedFileDeleted;
+using vms::recording::RecordingCatalogEvent;
 using vms::recording::RecordedFileCatalog;
 using vms::recording::RecordingOptions;
 using vms::recording::RecordingFileStore;
+using vms::recording::test::CollectEvents;
+using vms::recording::test::FragmentsMatchIndex;
 using vms::recording::test::MakeCloseTask;
 using vms::recording::test::MakeOpenTask;
 using vms::recording::test::MakeWriteTask;
@@ -81,11 +90,18 @@ bool PairMissing(const fs::path& stem_path) {
 }
 
 
+// 알림이 지정한 폴더와 파일 이름의 삭제 알림인지 확인한다.
+bool IsDeletion(const RecordingCatalogEvent& event, std::string_view camera_folder, const std::string& stem) {
+    const auto* deleted = std::get_if<RecordedFileDeleted>(&event);
+    return deleted && deleted->camera_folder == camera_folder && deleted->stem == stem;
+}
+
+
 // 작업 순서대로 파일 짝이 생기고, 색인 레코드가 moof로 시작하는 조각을 가리키며 CRC32가 맞는지 검사한다.
 void TestWritesFragmentsAndIndex() {
     const TemporaryDirectory temporary;
     std::atomic<std::uint64_t> free_bytes = kPlentyOfSpace;
-    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {});
+    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {}, {});
 
     store.Execute(MakeOpenTask("front", kBaseUnixMs + 123));
     for (std::uint32_t index = 0; index < 3; ++index) {
@@ -104,11 +120,41 @@ void TestWritesFragmentsAndIndex() {
 }
 
 
+// 파일을 닫으면 디스크의 색인과 같은 조각 목록을 담아 알리고, 조각 없이 닫은 파일은 알리지 않는지 검사한다.
+void TestClosedFileNotification() {
+    const TemporaryDirectory temporary;
+    std::atomic<std::uint64_t> free_bytes = kPlentyOfSpace;
+    std::vector<RecordingCatalogEvent> events;
+    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {}, CollectEvents(events));
+
+    store.Execute(MakeOpenTask("front", kBaseUnixMs + 123));
+    for (std::uint32_t index = 0; index < 3; ++index) {
+        store.Execute(MakeWriteTask("front", index * kOneSecond, kOneSecond));
+    }
+    Expect(events.empty(), "열린 파일은 알리지 않음");
+    store.Execute(MakeCloseTask("front"));
+    store.Execute(MakeOpenTask("back", kBaseUnixMs));
+    store.Execute(MakeCloseTask("back"));
+
+    Expect(events.size() == 1, "조각 없이 닫은 back 파일은 알리지 않아 알림은 하나");
+    const auto* closed = events.empty() ? nullptr : std::get_if<RecordedFileClosed>(&events[0]);
+    Expect(closed != nullptr, "닫기 알림");
+    if (closed == nullptr) {
+        return;
+    }
+    Expect(closed->camera_folder == "front" && closed->file.stem == FormatRecordingFileStem(kBaseUnixMs, 0) &&
+               closed->file.start_unix_ms == kBaseUnixMs + 123 && closed->file.duration == 3 * kOneSecond,
+           "닫기 알림의 폴더, 파일 이름, 시작 시각, 길이");
+    Expect(FragmentsMatchIndex(closed->file.fragments, StemPath(temporary.Path(), "front", kBaseUnixMs)),
+           "닫기 알림의 조각 목록은 디스크의 색인 레코드와 같음");
+}
+
+
 // 같은 이름의 파일이 있으면 번호를 붙이고, 조각 없이 닫은 파일은 남기지 않는지 검사한다.
 void TestNameCollisionAndEmptyFile() {
     const TemporaryDirectory temporary;
     std::atomic<std::uint64_t> free_bytes = kPlentyOfSpace;
-    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {});
+    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {}, {});
 
     for (int round = 0; round < 2; ++round) {
         store.Execute(MakeOpenTask("front", kBaseUnixMs));
@@ -130,7 +176,8 @@ void TestRetention() {
     std::atomic<std::uint64_t> free_bytes = kPlentyOfSpace;
     RecordingOptions options = MakeOptions(temporary.Path(), free_bytes);
     options.retention_seconds = 2;
-    RecordingFileStore store(std::move(options), {});
+    std::vector<RecordingCatalogEvent> events;
+    RecordingFileStore store(std::move(options), {}, CollectEvents(events));
 
     // 파일마다 1초이고 서로 1시간씩 떨어져 있다. 그 사이 시간은 분량에 들지 않는다.
     const std::int64_t starts[] = {kBaseUnixMs, kBaseUnixMs + 3'600'000, kBaseUnixMs + 7'200'000};
@@ -145,6 +192,9 @@ void TestRetention() {
     store.Execute(MakeWriteTask("front", 0, kOneSecond));
     store.Execute(MakeCloseTask("front"));
     Expect(PairMissing(StemPath(temporary.Path(), "front", starts[0])), "분량을 넘으면 가장 오래된 파일 짝 삭제");
+    Expect(events.size() == 4 && std::holds_alternative<RecordedFileClosed>(events[2]) &&
+               IsDeletion(events[3], "front", FormatRecordingFileStem(starts[0], 0)),
+           "세 번째 파일의 닫기 알림 뒤에 가장 오래된 파일의 삭제 알림");
     Expect(PairExists(StemPath(temporary.Path(), "front", starts[1])) &&
                PairExists(StemPath(temporary.Path(), "front", starts[2])),
            "최근 파일은 남음");
@@ -161,7 +211,7 @@ void TestEmergencyDeletion() {
     const std::int64_t back_first = kBaseUnixMs + 5'000;
     const std::int64_t front_second = kBaseUnixMs + 60'000;
     {
-        RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {});
+        RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {}, {});
         for (const auto& [camera_name, start] :
              {std::pair{"front", front_first}, std::pair{"back", back_first}, std::pair{"front", front_second}}) {
             store.Execute(MakeOpenTask(camera_name, start));
@@ -173,25 +223,29 @@ void TestEmergencyDeletion() {
     // back은 이번 실행에 등록하지 않은 카메라로, 복구 결과 목록에만 있다.
     const RecordedFileCatalog catalog = {
         {"back", {RecordedFile{.stem = FormatRecordingFileStem(back_first, 0), .start_unix_ms = back_first,
-                               .duration = kOneSecond}}},
+                               .duration = kOneSecond, .fragments = {}}}},
         {"front",
          {RecordedFile{.stem = FormatRecordingFileStem(front_first, 0), .start_unix_ms = front_first,
-                       .duration = kOneSecond},
+                       .duration = kOneSecond, .fragments = {}},
           RecordedFile{.stem = FormatRecordingFileStem(front_second, 0), .start_unix_ms = front_second,
-                       .duration = kOneSecond}}},
+                       .duration = kOneSecond, .fragments = {}}}},
     };
     RecordingOptions options = MakeOptions(temporary.Path(), free_bytes);
     std::atomic<int> low_answers = 1;
     options.query_free_space = [&low_answers](const fs::path&) -> std::expected<std::uint64_t, std::error_code> {
         return low_answers.fetch_sub(1) > 0 ? 0 : kPlentyOfSpace;
     };
-    RecordingFileStore store(std::move(options), catalog);
+    std::vector<RecordingCatalogEvent> events;
+    RecordingFileStore store(std::move(options), catalog, CollectEvents(events));
     store.Execute(MakeOpenTask("front", kBaseUnixMs + 120'000));
 
     Expect(PairMissing(StemPath(temporary.Path(), "front", front_first)), "가장 오래된 구간의 front 파일 삭제");
     Expect(PairMissing(StemPath(temporary.Path(), "back", back_first)), "같은 구간의 등록되지 않은 back 파일 삭제");
     Expect(PairExists(StemPath(temporary.Path(), "front", front_second)), "다음 구간 파일은 남음");
     Expect(PairExists(StemPath(temporary.Path(), "front", kBaseUnixMs + 120'000)), "삭제 뒤 새 파일을 엶");
+    Expect(events.size() == 2 && IsDeletion(events[0], "back", FormatRecordingFileStem(back_first, 0)) &&
+               IsDeletion(events[1], "front", FormatRecordingFileStem(front_first, 0)),
+           "비상 삭제로 지운 파일마다 삭제 알림");
 }
 
 
@@ -199,7 +253,7 @@ void TestEmergencyDeletion() {
 void TestOpenFileIsNotDeleted() {
     const TemporaryDirectory temporary;
     std::atomic<std::uint64_t> free_bytes = kPlentyOfSpace;
-    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {});
+    RecordingFileStore store(MakeOptions(temporary.Path(), free_bytes), {}, {});
 
     store.Execute(MakeOpenTask("front", kBaseUnixMs));
     store.Execute(MakeWriteTask("front", 0, kOneSecond));
@@ -222,6 +276,7 @@ void TestOpenFileIsNotDeleted() {
 
 int main() {
     TestWritesFragmentsAndIndex();
+    TestClosedFileNotification();
     TestNameCollisionAndEmptyFile();
     TestRetention();
     TestEmergencyDeletion();

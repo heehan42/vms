@@ -50,7 +50,7 @@ constexpr std::string_view kSingleFrameVideo =
 constexpr std::string_view kNextFrame = "\x00\x00\x01\x41\x9A\x02\x03"sv;
 
 
-// "시험 \"1\".h264"의 UTF-8 바이트. JSON 이스케이프와 퍼센트 인코딩 검사에 쓴다.
+// "시험 \"1\".h264"의 UTF-8 바이트. offer의 name 퍼센트 인코딩 검사에 쓴다.
 constexpr std::string_view kKoreanVideoId = "\xEC\x8B\x9C\xED\x97\x98 \"1\".h264";
 
 
@@ -133,24 +133,6 @@ void TestOfferSourceParameter(Signaling& signaling, std::string_view offer) {
 }
 
 
-// 소스 목록 JSON의 순서, 종류, 프레임 수, 이스케이프를 검사한다.
-//
-// signaling: 동영상 세 개와 카메라 두 대가 있는 엔드포인트
-void TestSourceList(const Signaling& signaling) {
-    const auto response = signaling.HandleSourceList();
-    Expect(response.status == HttpStatus::kOk, "목록 200");
-    Expect(response.content_type == "application/json", "목록 Content-Type");
-    Expect(response.body == "{\"sources\":["
-                            "{\"type\":\"file\",\"name\":\"a.h264\",\"frames\":2},"
-                            "{\"type\":\"file\",\"name\":\"b.h264\",\"frames\":1},"
-                            "{\"type\":\"file\",\"name\":\"\xEC\x8B\x9C\xED\x97\x98 \\\"1\\\".h264\",\"frames\":1},"
-                            "{\"type\":\"camera\",\"name\":\"front\"},"
-                            "{\"type\":\"camera\",\"name\":\"a.h264\"}"
-                            "]}",
-           "파일은 이름의 바이트 순서로 먼저, 카메라는 등록 순서로 뒤에 두고 카메라 원소에는 frames가 없음");
-}
-
-
 }  // namespace
 
 
@@ -196,12 +178,10 @@ int main() {
 
     Signaling signaling(**agent, *certificate, loaded->library, cameras);
     TestOfferSourceParameter(signaling, offer);
-    TestSourceList(signaling);
 
     const VideoLibrary empty_library;
     const CameraList empty_cameras;
     Signaling empty_signaling(**agent, *certificate, empty_library, empty_cameras);
-    Expect(empty_signaling.HandleSourceList().body == "{\"sources\":[]}", "소스 없이 실행하면 빈 배열");
     Expect(PostOffer(empty_signaling, "/offer", offer) == HttpStatus::kOk, "빈 목록에서도 type·name 없는 offer는 200");
 
     // 에이전트는 루프, DTLS 컨텍스트, 동영상 목록보다 먼저 소멸해야 한다.

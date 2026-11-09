@@ -8,9 +8,11 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include "core/unique_fd.h"
 #include "recording/recorded_file.h"
+#include "recording/recording_catalog_event.h"
 #include "recording/recording_options.h"
 #include "recording/recording_task.h"
 
@@ -30,6 +32,8 @@ std::expected<std::uint64_t, std::error_code> QueryFileSystemFreeSpace(const std
 // 파일 열기·조각 쓰기·닫기와 동기화, 보관 분량 삭제, 비상 삭제를 한다. 스레드를 만들지 않으며 한 스레드(녹화
 // 스레드)에서만 쓴다. 카메라 폴더(<녹화 디렉터리>/<카메라 이름>)는 만든 쪽(main)이 미리 준비해야 한다.
 //
+// 파일을 닫아 닫힌 파일 목록에 더하거나 닫힌 파일을 지우면 알림 함수로 알린다.
+//
 // 녹화 오류로 서버를 멈추지 않는다. 실패하면 로그를 남기고 그 파일을 닫으며, 그 카메라의 조각은 다음 열기 작업까지
 // 버린다. 열린 파일 디스크립터를 소유하며, 소멸할 때 열린 파일을 동기화해 닫는다.
 class RecordingFileStore {
@@ -37,8 +41,10 @@ public:
     // 저장소를 만든다. 파일은 열지 않는다.
     //
     // options: 녹화 설정. 범위 검사를 마친 값이어야 한다.
-    // closed_files: 시작할 때 이미 있는 닫힌 파일 목록(복구 결과). 등록되지 않은 카메라 폴더도 포함한다.
-    RecordingFileStore(RecordingOptions options, RecordedFileCatalog closed_files);
+    // closed_files: 시작할 때 이미 있는 닫힌 파일 목록(복구 결과). 등록되지 않은 카메라 폴더도 포함한다. 조각 목록은
+    //               쓰지 않으므로 비운 사본을 넘겨도 된다.
+    // listener: 닫힌 파일 목록의 변경을 받는 함수. 이 저장소를 쓰는 스레드에서 불린다. 비어 있으면 알리지 않는다.
+    RecordingFileStore(RecordingOptions options, RecordedFileCatalog closed_files, RecordingCatalogListener listener);
 
 
     // 열린 파일을 모두 동기화해 닫는다.
@@ -104,8 +110,8 @@ private:
         std::uint64_t end_time = 0;
 
 
-        // 쓴 조각 수
-        std::size_t fragment_count = 0;
+        // 녹화 파일과 색인 파일에 모두 완전히 쓴 조각의 목록. 파일 안 순서다. 닫을 때 알림에 담는다.
+        std::vector<RecordedFragment> fragments;
 
 
         // 마지막 동기화 뒤에 쓴 데이터가 있는지 여부
@@ -127,11 +133,12 @@ private:
 
     // 열린 파일을 마지막으로 완전히 쓴 위치까지 되돌리고 동기화해 닫는다.
     //
-    // 조각이 하나 이상이면 닫힌 파일 목록에 더하고 보관 분량을 검사한다. 조각이 없으면 파일 짝을 지운다.
+    // 조각이 하나 이상이면 닫힌 파일 목록에 조각 목록을 비운 사본을 더하고, 조각 목록을 담아 닫기를 알린 뒤 보관
+    // 분량을 검사한다. 조각이 없으면 파일 짝을 지우고 알리지 않는다. 그 파일은 닫힌 파일 목록에 들어간 적이 없다.
     void FinishFile(const std::string& camera_name);
 
 
-    // 카메라의 닫힌 파일 길이 합이 보관 분량을 넘으면 가장 오래된 파일부터 지운다.
+    // 카메라의 닫힌 파일 길이 합이 보관 분량을 넘으면 가장 오래된 파일부터 지우고, 지운 파일마다 알린다.
     void ApplyRetention(const std::string& camera_name);
 
 
@@ -139,7 +146,7 @@ private:
     void DeleteWhileLowOnSpace();
 
 
-    // 모든 카메라 폴더에서 가장 오래된 단위 구간에 속한 닫힌 파일을 함께 지운다.
+    // 모든 카메라 폴더에서 가장 오래된 단위 구간에 속한 닫힌 파일을 함께 지우고, 지운 파일마다 알린다.
     //
     // 반환값: 지울 닫힌 파일이 있었으면 true
     bool DeleteOldestSegment();
@@ -152,6 +159,10 @@ private:
     // offset: 쓸 위치
     // 반환값: 성공하면 빈 오류 코드. 실패하면 마지막 오류
     std::error_code WriteWithSpaceRetry(int fd, std::span<const std::uint8_t> bytes, std::uint64_t offset);
+
+
+    // 알림 함수가 있으면 알림을 넘긴다.
+    void Notify(RecordingCatalogEvent event);
 
 
     // 여유 공간을 조회한다. 설정의 조회 함수가 비어 있으면 statvfs를 쓴다.
@@ -172,6 +183,10 @@ private:
 
     // 카메라별 쓰고 있는 파일
     std::map<std::string, OpenRecording> open_files_;
+
+
+    // 닫힌 파일 목록의 변경을 받는 함수. 비어 있을 수 있다.
+    RecordingCatalogListener listener_;
 };
 
 

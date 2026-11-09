@@ -26,6 +26,10 @@
 #include "http/http_server.h"
 #include "media/camera_list.h"
 #include "media/video_library.h"
+#include "playback/hls_playlist.h"
+#include "playback/recording_library.h"
+#include "playback/recording_playback_endpoints.h"
+#include "playback/source_list.h"
 #include "recording/camera_recorder.h"
 #include "recording/recording_options.h"
 #include "recording/recording_recovery.h"
@@ -47,8 +51,12 @@ using vms::http::HttpServer;
 using vms::http::HttpServerConfig;
 using vms::media::CameraList;
 using vms::media::VideoLibrary;
+using vms::playback::RecordingLibrary;
+using vms::playback::RecordingPlaybackEndpoints;
 using vms::recording::CameraRecorder;
+using vms::recording::RecordedFile;
 using vms::recording::RecordedFileCatalog;
+using vms::recording::RecordingCatalogEvent;
 using vms::recording::RecordingOptions;
 using vms::recording::RecordingWriter;
 using vms::rtsp::RtspCameraClient;
@@ -473,6 +481,26 @@ std::expected<RecordedFileCatalog, std::string> PrepareRecordingDirectory(const 
 }
 
 
+// 녹화 스레드에 넘길, 조각 목록을 비운 닫힌 파일 목록 사본을 만든다.
+//
+// catalog: 복구한 카메라 폴더별 닫힌 파일 목록
+// 반환값: 폴더, 파일 이름, 시작 시각, 길이는 같고 조각 목록은 빈 사본
+//
+// 녹화 스레드는 보관 분량과 비상 삭제 판단에 시작 시각과 길이만 쓰므로, 조각 목록을 이벤트 루프 스레드의
+// RecordingLibrary와 두 벌로 갖지 않게 한다.
+RecordedFileCatalog WithoutFragments(const RecordedFileCatalog& catalog) {
+    RecordedFileCatalog copy;
+    for (const auto& [camera_folder, files] : catalog) {
+        std::vector<RecordedFile>& copied_files = copy[camera_folder];
+        for (const RecordedFile& file : files) {
+            copied_files.push_back(RecordedFile{
+                .stem = file.stem, .start_unix_ms = file.start_unix_ms, .duration = file.duration, .fragments = {}});
+        }
+    }
+    return copy;
+}
+
+
 }  // namespace
 
 
@@ -554,9 +582,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // 재생할 수 있는 녹화 목록은 카메라 유무와 관계없이 복구 결과로 채운다. 녹화 스레드의 알림이 루프로 넘긴 작업이
+    // 이 목록을 참조하고, 그 작업은 루프가 소멸할 때까지 남아 있을 수 있으므로 루프보다 먼저 선언해 나중에 소멸하게
+    // 한다.
+    RecordedFileCatalog writer_files = WithoutFragments(*recovered_files);
+    RecordingLibrary recording_library(*std::move(recovered_files));
+
+    // 녹화 스레드가 Post()로 알림을 넘기므로, 루프를 녹화 스레드보다 먼저 만들어 나중에 소멸하게 한다.
+    auto loop = EventLoop::Create();
+    if (!loop) {
+        std::println(stderr, "이벤트 루프 생성 실패: {}", loop.error().message());
+        return 1;
+    }
+    EventLoop& event_loop = *loop;
+
     // 녹화 상태가 작업 큐를 참조하므로 큐(녹화 스레드)를 먼저 선언해 나중에 소멸하게 한다. 녹화 상태는 카메라 소스를
     // 구독하므로 카메라 목록보다 나중에 선언해 먼저 소멸하며, 소멸할 때 구독을 해지한다. 카메라 클라이언트의 Stop()이
     // 루프를 멈추기 전에 끊김을 알리므로, 녹화 스레드가 소멸할 때 큐에는 마지막 닫기 작업까지 들어 있다.
+    // 녹화 스레드는 소멸자에서 남은 작업을 처리하고 join하므로 루프보다 먼저 끝난다. 그때 마지막 파일을 닫으며 넘긴
+    // 알림 작업은 Run()이 반환된 뒤라 실행되지 않고 루프와 함께 파괴된다.
     // 카메라가 없으면 녹화 스레드를 시작하지 않아, 보관 삭제나 비상 삭제도 일어나지 않는다.
     std::unique_ptr<RecordingWriter> recording_writer;
     std::vector<std::unique_ptr<CameraRecorder>> camera_recorders;
@@ -565,7 +609,15 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "녹화 설정: 디렉터리 {}, 단위 {}초, 보관 {}초, 동기화 {}초, 최소 여유 공간 {}MiB",
                      recording.directory.string(), recording.segment_seconds, recording.retention_seconds,
                      recording.sync_interval_seconds, recording.min_free_bytes / (1024 * 1024));
-        recording_writer = std::make_unique<RecordingWriter>(recording, *std::move(recovered_files));
+
+        // 녹화 스레드에서 불리는 알림 함수. 녹화 목록은 이벤트 루프 스레드만 고치므로 반영은 루프 작업으로 넘긴다.
+        auto apply_on_loop = [&event_loop, &recording_library](RecordingCatalogEvent event) {
+            event_loop.Post([&recording_library, event = std::move(event)]() mutable {
+                recording_library.Apply(std::move(event));
+            });
+        };
+        recording_writer =
+            std::make_unique<RecordingWriter>(recording, std::move(writer_files), std::move(apply_on_loop));
         for (const auto& entry : cameras.Entries()) {
             camera_recorders.push_back(std::make_unique<CameraRecorder>(
                 entry->name, entry->source, recording.segment_seconds, *recording_writer,
@@ -573,24 +625,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    auto loop = EventLoop::Create();
-    if (!loop) {
-        std::println(stderr, "이벤트 루프 생성 실패: {}", loop.error().message());
-        return 1;
-    }
-
     // 카메라 클라이언트는 루프와 카메라 소스를 참조하므로 둘보다 나중에 선언해 먼저 소멸하게 한다. 에이전트보다는
     // 나중에 소멸하지만, 에이전트가 소멸할 때 구독을 모두 해지하므로 끊김 알림이 소멸한 세션에 가지 않는다.
     std::vector<std::unique_ptr<RtspCameraClient>> camera_clients;
 
     // 종료 시그널을 받으면 카메라에 TEARDOWN을 보내고 루프를 멈춰, 아래의 정상 종료 경로로 이어지게 한다.
-    auto signal_watcher = TerminationSignalWatcher::Start(*loop, [&loop, &camera_clients](int signal_number) {
+    auto signal_watcher = TerminationSignalWatcher::Start(event_loop, [&event_loop, &camera_clients](int signal_number) {
         std::println(stderr, "{} 수신, 서버를 종료합니다",
                      signal_number == SIGINT ? "SIGINT" : "SIGTERM");
         for (const std::unique_ptr<RtspCameraClient>& client : camera_clients) {
             client->Stop();
         }
-        loop->Stop();
+        event_loop.Stop();
     });
     if (!signal_watcher) {
         std::println(stderr, "종료 시그널 설정 실패: {}", signal_watcher.error().message());
@@ -612,7 +658,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto ice_agent = IceLiteAgent::Start(*loop,
+    auto ice_agent = IceLiteAgent::Start(event_loop,
                                          IceLiteAgentConfig{.addresses = *std::move(ice_addresses),
                                                             .port = options->ice_port,
                                                             .video_fps = options->video_fps},
@@ -626,16 +672,27 @@ int main(int argc, char* argv[]) {
     }
 
     // 웹 서버의 /offer 핸들러가 같은 프로세스의 ICE-lite 에이전트를 직접 호출한다.
-    // 소멸은 선언 역순이므로 HttpServer가 Signaling보다, Signaling이 에이전트, 인증서, 동영상·카메라 목록보다
-    // 먼저 사라진다.
+    // 소멸은 선언 역순이므로 HttpServer가 Signaling과 녹화 재생 엔드포인트보다, Signaling이 에이전트, 인증서,
+    // 동영상·카메라 목록보다, 녹화 재생 엔드포인트가 녹화 목록보다 먼저 사라진다.
     Signaling signaling(**ice_agent, *certificate, video_library, cameras);
+    RecordingPlaybackEndpoints recording_endpoints(recording_library, options->recording.directory);
     vms::http::HttpEndpoints endpoints;
     endpoints.post.emplace("/offer", [&signaling](const HttpRequest& request, std::string_view body) {
         return signaling.HandleOffer(request, body);
     });
-    endpoints.get.emplace("/api/sources", [&signaling](const HttpRequest&) { return signaling.HandleSourceList(); });
+    endpoints.get.emplace("/api/sources", [&video_library, &cameras, &recording_library](const HttpRequest&) {
+        return vms::playback::BuildSourceListResponse(video_library, cameras, recording_library);
+    });
+    endpoints.get.emplace(std::string(vms::playback::kRecordingPlaylistPath),
+                          [&recording_endpoints](const HttpRequest& request) -> vms::http::HttpGetResult {
+                              return recording_endpoints.HandlePlaylist(request);
+                          });
+    endpoints.get.emplace(std::string(vms::playback::kRecordingFilePath),
+                          [&recording_endpoints](const HttpRequest& request) {
+                              return recording_endpoints.HandleFile(request);
+                          });
 
-    auto server = HttpServer::Start(*loop, options->http, std::move(endpoints));
+    auto server = HttpServer::Start(event_loop, options->http, std::move(endpoints));
     if (!server) {
         std::println(stderr, "서버 시작 실패 (포트 {}): {}", options->http.port,
                      server.error().message());
@@ -646,12 +703,12 @@ int main(int argc, char* argv[]) {
 
     // 카메라 연결 실패는 시작 오류가 아니다. 클라이언트가 로그를 남기고 재연결 간격 뒤 다시 시도한다.
     for (std::size_t index = 0; index < camera_client_configs.size(); ++index) {
-        camera_clients.push_back(RtspCameraClient::Create(*loop, std::move(camera_client_configs[index]),
+        camera_clients.push_back(RtspCameraClient::Create(event_loop, std::move(camera_client_configs[index]),
                                                           cameras.Entries()[index]->source));
         camera_clients.back()->Start();
     }
 
-    if (const std::error_code run_error = loop->Run()) {
+    if (const std::error_code run_error = event_loop.Run()) {
         std::println(stderr, "이벤트 루프 오류: {}", run_error.message());
         return 1;
     }

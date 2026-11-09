@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "recording/recorded_file.h"
+#include "recording/recording_catalog_event.h"
 #include "recording/recording_file_store.h"
 #include "recording/recording_options.h"
 #include "recording/recording_task.h"
@@ -28,8 +29,11 @@ public:
     // 녹화 스레드를 시작한다.
     //
     // options: 녹화 설정. 범위 검사를 마친 값이어야 한다.
-    // closed_files: 시작할 때 이미 있는 닫힌 파일 목록(복구 결과). 등록되지 않은 카메라 폴더도 포함한다.
-    RecordingWriter(RecordingOptions options, RecordedFileCatalog closed_files);
+    // closed_files: 시작할 때 이미 있는 닫힌 파일 목록(복구 결과). 등록되지 않은 카메라 폴더도 포함한다. 조각 목록은
+    //               쓰지 않으므로 비운 사본을 넘겨도 된다.
+    // listener: 녹화 스레드가 파일을 닫거나 지울 때 부르는 함수. 녹화 스레드에서 불리며, 소멸자에서 마지막 파일을 닫을
+    //           때도 불린다. 그래서 이 함수가 참조하는 객체는 이 객체보다 오래 살아 있어야 한다. 비어 있으면 알리지 않는다.
+    RecordingWriter(RecordingOptions options, RecordedFileCatalog closed_files, RecordingCatalogListener listener);
 
 
     // 남은 작업을 모두 처리하고 열린 파일을 닫은 뒤 녹화 스레드를 끝낸다.

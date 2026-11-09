@@ -12,6 +12,7 @@
 #include <print>
 #include <span>
 #include <system_error>
+#include <utility>
 
 #include "core/system_error.h"
 #include "core/unique_fd.h"
@@ -166,6 +167,7 @@ PairOutcome RecoverPair(const fs::path& stem_path, const std::string& stem, Reco
     std::size_t valid_count = 0;
     std::uint64_t valid_video_end = 0;
     RecordingIndexRecord last_valid_record;
+    std::vector<RecordedFragment> valid_fragments;
     std::vector<std::uint8_t> fragment;
     for (std::size_t offset = kRecordingIndexHeaderSize; offset + kRecordingIndexRecordSize <= index_bytes.size();
          offset += kRecordingIndexRecordSize) {
@@ -183,6 +185,9 @@ PairOutcome RecoverPair(const fs::path& stem_path, const std::string& stem, Reco
         ++valid_count;
         valid_video_end = record->offset + record->size;
         last_valid_record = *record;
+        valid_fragments.push_back(RecordedFragment{
+            .start_time = record->start_time, .duration = record->duration, .offset = record->offset,
+            .size = record->size});
     }
     if (valid_count == 0) {
         return delete_pair();
@@ -204,7 +209,8 @@ PairOutcome RecoverPair(const fs::path& stem_path, const std::string& stem, Reco
 
     recovered = RecordedFile{.stem = stem,
                              .start_unix_ms = header->start_unix_ms,
-                             .duration = last_valid_record.start_time + last_valid_record.duration};
+                             .duration = last_valid_record.start_time + last_valid_record.duration,
+                             .fragments = std::move(valid_fragments)};
     return needs_truncation ? PairOutcome::kTruncated : PairOutcome::kKept;
 }
 

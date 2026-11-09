@@ -60,6 +60,27 @@ std::expected<std::string, QueryParameterError> DecodeQueryComponent(std::string
 }  // namespace
 
 
+std::string EncodeQueryComponent(std::string_view value) {
+    constexpr std::string_view kHexDigits = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(value.size());
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        const bool is_unreserved = (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+                                   (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' ||
+                                   byte == '~';
+        if (is_unreserved) {
+            encoded.push_back(character);
+            continue;
+        }
+        encoded.push_back('%');
+        encoded.push_back(kHexDigits[byte >> 4]);
+        encoded.push_back(kHexDigits[byte & 0x0F]);
+    }
+    return encoded;
+}
+
+
 std::expected<std::optional<std::string>, QueryParameterError> FindQueryParameter(std::string_view target,
                                                                                    std::string_view name) {
     const std::size_t query_start = target.find('?');

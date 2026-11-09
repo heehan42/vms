@@ -6,6 +6,7 @@
 
 #include "test_support.h"
 
+using vms::http::EncodeQueryComponent;
 using vms::http::FindQueryParameter;
 using vms::http::QueryParameterError;
 using vms::test::Expect;
@@ -46,10 +47,37 @@ void ExpectError(std::string_view target, QueryParameterError error, std::string
 }
 
 
+// 퍼센트 인코딩한 값을 쿼리 매개변수로 붙여 다시 찾으면 원래 값이 나오는지 확인한다.
+//
+// value: 인코딩할 값
+// description: 실패 시 출력할 설명
+void ExpectRoundTrip(std::string_view value, std::string_view description) {
+    const std::string target = "/api?video=" + EncodeQueryComponent(value);
+    const auto found = FindQueryParameter(target, "video");
+    Expect(found.has_value() && found->has_value() && **found == value, description);
+}
+
+
+// 퍼센트 인코딩 결과와 디코딩 왕복을 검사한다.
+void TestEncodeQueryComponent() {
+    Expect(EncodeQueryComponent("\xEC\xA0\x95\xEB\xAC\xB8 1") == "%EC%A0%95%EB%AC%B8%201", "한글과 공백");
+    Expect(EncodeQueryComponent("AZaz09-._~") == "AZaz09-._~", "unreserved 문자는 그대로");
+    Expect(EncodeQueryComponent("a&b=c\"d+e/f\n") == "a%26b%3Dc%22d%2Be%2Ff%0A", "구분자, 따옴표, 줄바꿈");
+    Expect(EncodeQueryComponent("") == "", "빈 값");
+
+    ExpectRoundTrip("\xEC\xA0\x95\xEB\xAC\xB8 1", "한글과 공백 왕복");
+    ExpectRoundTrip("\xEC\xA0\x95\xEB\xAC\xB8 \"1\"", "따옴표 왕복");
+    ExpectRoundTrip("a+b&c=d%e", "구분자와 '%' 왕복");
+    ExpectRoundTrip(std::string_view("\x00\xFF", 2), "임의 바이트 왕복");
+}
+
+
 }  // namespace
 
 
 int main() {
+    TestEncodeQueryComponent();
+
     ExpectAbsent("/offer", "쿼리 없음");
     ExpectAbsent("/offer?", "빈 쿼리");
     ExpectAbsent("/offer?debug=1&other=2", "매개변수 없음");

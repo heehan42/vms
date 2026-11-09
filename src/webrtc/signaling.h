@@ -13,10 +13,10 @@
 namespace vms::webrtc {
 
 
-// 웹 페이지가 쓰는 API 엔드포인트. POST /offer와 GET /api/sources를 처리한다.
+// 웹 페이지가 WebRTC 연결을 시작할 때 쓰는 POST /offer 엔드포인트.
 //
-// POST /offer는 브라우저의 SDP offer와 고른 소스의 종류·이름을 해석해 ICE 세션을 만들고 SDP answer로 응답한다.
-// GET /api/sources는 소스 목록을 JSON으로 응답한다.
+// 브라우저의 SDP offer와 고른 소스의 종류·이름을 해석해 ICE 세션을 만들고 SDP answer로 응답한다. 소스 목록
+// (GET /api/sources)은 녹화 소스까지 담으므로 playback::BuildSourceListResponse가 만든다.
 // ICE-lite 에이전트를 같은 프로세스에서 직접 호출한다. 에이전트, 인증서, 동영상·카메라 목록은 참조만 하며
 // 소유하지 않으므로, 모두 이 객체보다 오래 살아 있어야 한다. 이 객체를 핸들러로 등록한 HttpServer는
 // 이 객체보다 먼저 소멸해야 한다.
@@ -52,14 +52,6 @@ public:
     //
     // 판정 순서는 Content-Type, 소스(해석 오류 → 한쪽만 옴 → 종류 → 목록 존재), SDP다. 오류 응답이면 세션을 만들지 않는다.
     http::HttpEndpointResponse HandleOffer(const http::HttpRequest& request, std::string_view body);
-
-
-    // 소스 목록 요청 하나를 처리한다. HttpServer의 GET 핸들러로 등록해 쓴다.
-    //
-    // 반환값: 200, application/json, {"sources":[{"type":"file","name":"...","frames":N},...,{"type":"camera",
-    //   "name":"..."},...]}. 파일 원소를 동영상 목록 순서로 먼저 두고, 카메라 원소를 등록 순서로 그 뒤에 둔다. 카메라
-    //   원소에는 frames가 없다. 소스가 없으면 빈 배열이다.
-    http::HttpEndpointResponse HandleSourceList() const;
 
 
 private:

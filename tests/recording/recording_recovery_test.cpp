@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "recording/recording_file_name.h"
 #include "recording/recording_index.h"
@@ -64,7 +65,7 @@ void WriteNormalPairs(const fs::path& directory, std::initializer_list<const cha
         fs::create_directories(directory / camera_name);
     }
 
-    RecordingFileStore store(std::move(options), {});
+    RecordingFileStore store(std::move(options), {}, {});
     for (const char* camera_name : camera_names) {
         store.Execute(MakeOpenTask(camera_name, kStartUnixMs));
         for (std::uint32_t index = 0; index < kFragmentCount; ++index) {
@@ -105,6 +106,29 @@ const CameraRecoveryReport* FindReport(const RecordingRecoveryResult& result, st
         }
     }
     return nullptr;
+}
+
+
+// 복구한 파일의 조각 목록이 색인 레코드(CRC 제외)와 같은지 확인한다.
+//
+// file: 복구 결과의 파일
+// records: 비교할 색인 레코드. 앞에서부터 file의 조각 수만큼 비교한다.
+// expected_count: 기대하는 조각 수
+bool FragmentsMatchRecords(const vms::recording::RecordedFile& file,
+                           const std::vector<vms::recording::RecordingIndexRecord>& records,
+                           std::size_t expected_count) {
+    if (file.fragments.size() != expected_count || records.size() < expected_count) {
+        return false;
+    }
+    for (std::size_t index = 0; index < expected_count; ++index) {
+        const auto& fragment = file.fragments[index];
+        const auto& record = records[index];
+        if (fragment.start_time != record.start_time || fragment.duration != record.duration ||
+            fragment.offset != record.offset || fragment.size != record.size) {
+            return false;
+        }
+    }
+    return true;
 }
 
 
@@ -153,6 +177,7 @@ void TestRecovery() {
            "정상 파일은 시작 시각·길이와 함께 목록에 들어감");
     Expect(fs::file_size(WithExtension(StemPath(directory, "normal"), ".mp4")) == normal_video_size,
            "정상 파일은 그대로");
+    Expect(FragmentsMatchRecords(normal_files[0], records, kFragmentCount), "정상 파일의 조각 목록은 색인 레코드와 같음");
     const CameraRecoveryReport* normal_report = FindReport(*result, "normal");
     Expect(normal_report && normal_report->kept_count == 1 && normal_report->truncated_count == 0 &&
                normal_report->deleted_count == 0,
@@ -167,6 +192,9 @@ void TestRecovery() {
            "색인 파일은 마지막 유효 레코드 끝에서 잘림");
     Expect(result->files.at("short_tail")[0].duration == 2 * kOneSecond, "잘린 파일의 길이");
     Expect(FindReport(*result, "short_tail")->truncated_count == 1, "잘라 낸 짝 수");
+    Expect(FragmentsMatchRecords(result->files.at("short_tail")[0], records, 2), "꼬리를 잘라 낸 파일은 남은 레코드 2개만 가짐");
+    Expect(FragmentsMatchRecords(result->files.at("bad_fragment")[0], records, 1), "바뀐 조각 앞의 레코드 1개만 가짐");
+    Expect(FragmentsMatchRecords(result->files.at("half_record")[0], records, 2), "반쪽 레코드 앞의 레코드 2개만 가짐");
 
     Expect(VerifyRecordingPair(StemPath(directory, "bad_fragment")) == 1, "바이트가 바뀐 조각부터 빠짐");
     Expect(VerifyRecordingPair(StemPath(directory, "half_record")) == 2, "반쪽 레코드가 빠짐");

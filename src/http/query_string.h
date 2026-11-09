@@ -36,4 +36,15 @@ std::expected<std::optional<std::string>, QueryParameterError> FindQueryParamete
                                                                                    std::string_view name);
 
 
+// 쿼리 매개변수의 이름이나 값 하나를 퍼센트 인코딩한다.
+//
+// value: 인코딩할 바이트열. 보통 UTF-8 문자열이다.
+// 반환값: 영문자, 숫자, '-', '.', '_', '~'(RFC 3986의 unreserved 문자)는 그대로 두고, 나머지 바이트를 대문자 16진수
+//         "%XX"로 바꾼 문자열
+//
+// 결과에는 '&', '=', '"', 공백, 줄바꿈이 남지 않으므로, 쿼리 문자열이나 HLS 재생 목록의 따옴표 속성 값에 그대로 넣을
+// 수 있다. FindQueryParameter로 디코딩하면 원래 값이 나온다.
+std::string EncodeQueryComponent(std::string_view value);
+
+
 }  // namespace vms::http

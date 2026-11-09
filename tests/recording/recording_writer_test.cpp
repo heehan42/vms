@@ -5,6 +5,8 @@
 #include <latch>
 #include <limits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 #include "recording/recording_file_name.h"
 #include "recording_test_support.h"
@@ -13,8 +15,12 @@
 namespace fs = std::filesystem;
 
 using vms::recording::FormatRecordingFileStem;
+using vms::recording::RecordedFileClosed;
+using vms::recording::RecordingCatalogEvent;
 using vms::recording::RecordingOptions;
 using vms::recording::RecordingWriter;
+using vms::recording::test::CollectEvents;
+using vms::recording::test::FragmentsMatchIndex;
 using vms::recording::test::MakeCloseTask;
 using vms::recording::test::MakeOpenTask;
 using vms::recording::test::MakeWriteTask;
@@ -59,7 +65,7 @@ fs::path StemPath(const fs::path& directory, std::int64_t start_unix_ms) {
 // 녹화 스레드가 큐의 작업을 순서대로 실행해 파일 짝을 만드는지 검사한다.
 void TestExecutesTasksInOrder() {
     const TemporaryDirectory temporary;
-    RecordingWriter writer(MakeOptions(temporary.Path()), {});
+    RecordingWriter writer(MakeOptions(temporary.Path()), {}, {});
     writer.Push(MakeOpenTask("front", kBaseUnixMs));
     for (std::uint32_t index = 0; index < 3; ++index) {
         writer.Push(MakeWriteTask("front", index * kOneSecond, kOneSecond));
@@ -82,7 +88,7 @@ void TestHasRoom() {
         release_writer.wait();
         return std::numeric_limits<std::uint64_t>::max();
     };
-    RecordingWriter writer(std::move(options), {});
+    RecordingWriter writer(std::move(options), {}, {});
 
     writer.Push(MakeOpenTask("front", kBaseUnixMs));
     Expect(writer.HasRoom(), "열기 작업은 크기 0");
@@ -104,13 +110,39 @@ void TestHasRoom() {
 void TestDrainsQueueOnDestruction() {
     const TemporaryDirectory temporary;
     {
-        RecordingWriter writer(MakeOptions(temporary.Path()), {});
+        RecordingWriter writer(MakeOptions(temporary.Path()), {}, {});
         writer.Push(MakeOpenTask("front", kBaseUnixMs));
         for (std::uint32_t index = 0; index < 50; ++index) {
             writer.Push(MakeWriteTask("front", index * kOneSecond, kOneSecond, 10'000));
         }
     }
     Expect(VerifyRecordingPair(StemPath(temporary.Path(), kBaseUnixMs)) == 50, "남은 조각 50개를 모두 기록");
+}
+
+
+// 녹화 스레드가 파일을 닫으면 알림 함수를 부르고, 소멸하면서 닫은 마지막 파일도 알리는지 검사한다.
+void TestNotifiesClosedFiles() {
+    const TemporaryDirectory temporary;
+    std::vector<RecordingCatalogEvent> events;
+    {
+        RecordingWriter writer(MakeOptions(temporary.Path()), {}, CollectEvents(events));
+        writer.Push(MakeOpenTask("front", kBaseUnixMs));
+        writer.Push(MakeWriteTask("front", 0, kOneSecond));
+        writer.Push(MakeCloseTask("front"));
+        writer.WaitUntilIdle();
+
+        const auto* closed = events.size() == 1 ? std::get_if<RecordedFileClosed>(&events[0]) : nullptr;
+        Expect(closed && closed->camera_folder == "front" &&
+                   FragmentsMatchIndex(closed->file.fragments, StemPath(temporary.Path(), kBaseUnixMs)),
+               "닫기 알림의 조각 목록은 디스크의 색인과 같음");
+
+        // 닫기 작업 없이 소멸시켜 소멸자가 파일을 닫게 한다.
+        writer.Push(MakeOpenTask("front", kBaseUnixMs + 60'000));
+        writer.Push(MakeWriteTask("front", 0, kOneSecond));
+    }
+    const auto* last = events.size() == 2 ? std::get_if<RecordedFileClosed>(&events[1]) : nullptr;
+    Expect(last && FragmentsMatchIndex(last->file.fragments, StemPath(temporary.Path(), kBaseUnixMs + 60'000)),
+           "소멸하면서 닫은 파일도 알림");
 }
 
 
@@ -121,5 +153,6 @@ int main() {
     TestExecutesTasksInOrder();
     TestHasRoom();
     TestDrainsQueueOnDestruction();
+    TestNotifiesClosedFiles();
     return vms::test::ExitCode();
 }

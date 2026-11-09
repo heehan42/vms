@@ -37,7 +37,8 @@ struct CameraRecoveryReport {
 
 // 녹화 디렉터리 전체의 복구 결과.
 struct RecordingRecoveryResult {
-    // 카메라 폴더별 남은 닫힌 파일 목록. RecordingWriter의 초기 목록이 된다.
+    // 카메라 폴더별 남은 닫힌 파일 목록. 파일마다 CRC 확인을 통과한 조각 목록을 담는다. 재생 목록과
+    // RecordingWriter(조각 목록을 비운 사본)의 초기 목록이 된다.
     RecordedFileCatalog files;
 
 

@@ -68,8 +68,17 @@ add_library(server_core STATIC
 target_include_directories(server_core PUBLIC src)
 target_link_libraries(server_core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
+# 녹화 재생(HLS 재생 목록, 녹화 파일 응답)과 소스 목록 JSON. 녹화·동영상·HTTP 구성 요소 위에 놓인다.
+add_library(playback STATIC
+    src/playback/hls_playlist.cpp
+    src/playback/recording_library.cpp
+    src/playback/recording_playback_endpoints.cpp
+    src/playback/source_list.cpp
+)
+target_link_libraries(playback PUBLIC server_core)
+
 add_executable(vms_web_server src/apps/web_server/main.cpp)
-target_link_libraries(vms_web_server PRIVATE server_core)
+target_link_libraries(vms_web_server PRIVATE server_core playback)
 
 enable_testing()
 add_subdirectory(tests)

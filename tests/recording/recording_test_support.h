@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "recording/recorded_file.h"
+#include "recording/recording_catalog_event.h"
 #include "recording/recording_index.h"
 #include "recording/recording_task.h"
 
@@ -161,6 +163,40 @@ inline std::optional<std::size_t> VerifyRecordingPair(const std::filesystem::pat
         }
     }
     return index->records.size();
+}
+
+
+// 조각 목록이 색인 파일의 레코드(CRC 제외)와 수와 값이 모두 같은지 확인한다.
+//
+// fragments: 확인할 조각 목록
+// stem_path: 확장자를 뺀 파일 짝 경로
+// 반환값: 같으면 true. 색인 헤더가 깨졌으면 false
+inline bool FragmentsMatchIndex(const std::vector<RecordedFragment>& fragments,
+                                const std::filesystem::path& stem_path) {
+    const auto index = ReadIndex(std::filesystem::path(stem_path.string() + ".idx"));
+    if (!index || index->records.size() != fragments.size()) {
+        return false;
+    }
+    for (std::size_t position = 0; position < fragments.size(); ++position) {
+        const RecordedFragment& fragment = fragments[position];
+        const RecordingIndexRecord& record = index->records[position];
+        if (fragment.start_time != record.start_time || fragment.duration != record.duration ||
+            fragment.offset != record.offset || fragment.size != record.size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// 닫힌 파일 목록의 변경 알림을 받은 순서대로 모으는 함수를 만든다.
+//
+// events: 알림을 모을 목록. 돌려준 함수보다 오래 살아 있어야 한다.
+// 반환값: RecordingFileStore·RecordingWriter에 넘길 알림 함수
+//
+// 잠금 없이 목록에 더하므로, RecordingWriter에 넘긴 경우 WaitUntilIdle이 반환된 뒤나 소멸한 뒤에만 목록을 읽는다.
+inline RecordingCatalogListener CollectEvents(std::vector<RecordingCatalogEvent>& events) {
+    return [&events](RecordingCatalogEvent event) { events.push_back(std::move(event)); };
 }
 
 

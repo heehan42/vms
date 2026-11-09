@@ -101,8 +101,9 @@ std::expected<std::uint64_t, std::error_code> QueryFileSystemFreeSpace(const std
 }
 
 
-RecordingFileStore::RecordingFileStore(RecordingOptions options, RecordedFileCatalog closed_files)
-    : options_(std::move(options)), closed_files_(std::move(closed_files)) {}
+RecordingFileStore::RecordingFileStore(RecordingOptions options, RecordedFileCatalog closed_files,
+                                       RecordingCatalogListener listener)
+    : options_(std::move(options)), closed_files_(std::move(closed_files)), listener_(std::move(listener)) {}
 
 
 RecordingFileStore::~RecordingFileStore() { CloseAllFiles(); }
@@ -231,7 +232,8 @@ void RecordingFileStore::WriteFragment(const std::string& camera_name, const Wri
     recording.index_size += kRecordingIndexRecordSize;
     recording.end_time = record.start_time + record.duration;
     ++recording.next_sequence_number;
-    ++recording.fragment_count;
+    recording.fragments.push_back(RecordedFragment{
+        .start_time = record.start_time, .duration = record.duration, .offset = record.offset, .size = record.size});
     recording.has_unsynced_data = true;
 }
 
@@ -249,7 +251,7 @@ void RecordingFileStore::FinishFile(const std::string& camera_name) {
     open_files_.erase(found);
     const std::filesystem::path stem_path = StemPath(camera_name, recording.stem);
 
-    if (recording.fragment_count == 0) {
+    if (recording.fragments.empty()) {
         recording.video_fd.Reset();
         recording.index_fd.Reset();
         RemoveFile(WithExtension(stem_path, kRecordingVideoExtension));
@@ -269,10 +271,14 @@ void RecordingFileStore::FinishFile(const std::string& camera_name) {
     recording.video_fd.Reset();
     recording.index_fd.Reset();
 
+    // 녹화 스레드의 목록은 조각 목록 없이 두고, 조각 목록은 알림으로만 넘긴다.
     std::vector<RecordedFile>& files = closed_files_[camera_name];
-    const RecordedFile closed{.stem = recording.stem, .start_unix_ms = recording.start_unix_ms,
-                              .duration = recording.end_time};
+    RecordedFile closed{.stem = recording.stem, .start_unix_ms = recording.start_unix_ms,
+                        .duration = recording.end_time, .fragments = {}};
     files.insert(std::ranges::upper_bound(files, closed.start_unix_ms, {}, &RecordedFile::start_unix_ms), closed);
+    closed.fragments = std::move(recording.fragments);
+    Notify(RecordedFileClosed{.camera_folder = camera_name, .file = std::move(closed)});
+
     ApplyRetention(camera_name);
 }
 
@@ -309,6 +315,7 @@ void RecordingFileStore::ApplyRetention(const std::string& camera_name) {
         RemoveFile(WithExtension(stem_path, kRecordingVideoExtension));
         RemoveFile(WithExtension(stem_path, kRecordingIndexExtension));
         Log(std::format("보관 분량 초과로 삭제: {}/{}", camera_name, oldest.stem));
+        Notify(RecordedFileDeleted{.camera_folder = camera_name, .stem = oldest.stem});
     }
 }
 
@@ -354,6 +361,7 @@ bool RecordingFileStore::DeleteOldestSegment() {
             const std::filesystem::path stem_path = StemPath(camera_name, file.stem);
             RemoveFile(WithExtension(stem_path, kRecordingVideoExtension));
             RemoveFile(WithExtension(stem_path, kRecordingIndexExtension));
+            Notify(RecordedFileDeleted{.camera_folder = camera_name, .stem = file.stem});
             ++deleted_count;
             return true;
         });
@@ -378,6 +386,13 @@ std::error_code RecordingFileStore::WriteWithSpaceRetry(int fd, std::span<const 
         DeleteWhileLowOnSpace();
     }
     return WriteFully(fd, bytes, offset);
+}
+
+
+void RecordingFileStore::Notify(RecordingCatalogEvent event) {
+    if (listener_) {
+        listener_(std::move(event));
+    }
 }
 
 

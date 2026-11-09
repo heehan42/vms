@@ -6,7 +6,7 @@
 SRTP 키를 정하는 DTLS 핸드셰이크, 그리고 서버의 H.264 파일을 RTP로 패킷화해 SRTP로 보내는 송신까지 구현되어 있습니다.
 브라우저 페이지에서 `--video-dir`로 지정한 디렉터리의 동영상을 골라 연결하면 그 영상이 반복 재생됩니다.
 `--camera`로 등록한 RTSP 카메라(예: vms-cam 저장소의 `vms_camera_server`)를 고르면 카메라의 실시간 영상이
-트랜스코딩 없이 재생됩니다.
+트랜스코딩 없이 재생됩니다. 서버는 등록한 카메라를 녹화하며, 녹화를 고르면 저장한 영상을 HLS로 다시 재생합니다.
 
 ## 필요한 도구
 
@@ -238,19 +238,118 @@ ffprobe -v error -show_entries stream=codec_name,width,height:format=duration -o
 ffplay recordings/cam/20261104T100105Z.mp4
 ```
 
-### 소스 목록과 선택 API
+### 녹화 재생
 
-웹 페이지는 `GET /api/sources`로 소스 목록을 받고, 고른 소스의 종류(`type`)와 이름(`name`)을 `POST /offer`의
-쿼리 매개변수로 보냅니다. `type`은 `file`(동영상 파일) 또는 `camera`(카메라)입니다. 목록에는 `file` 원소를
-이름순으로 먼저, `camera` 원소를 `--camera`로 등록한 순서대로 그 뒤에 둡니다. 카메라는 연결 상태와 관계없이 항상
-목록에 있습니다. `frames`(프레임 수)는 `file` 원소에만 있습니다.
+웹 페이지에서 "녹화 · <폴더>"를 고르고 연결 버튼을 누르면 그 카메라 폴더의 녹화를 처음부터 재생합니다. `<폴더>`는
+녹화 디렉터리 아래의 카메라 폴더 이름이며, 지금 `--camera`로 등록하지 않은 카메라의 폴더도 목록에 나옵니다. 녹화를
+재생하는 동안에는 영상 아래에 재생 막대가 나타나 다른 위치로 옮길 수 있고, "녹화 시각" 항목에 지금 보이는 화면이
+녹화된 시각(브라우저의 지역 시각)이 표시됩니다. "파일"이나 "카메라"를 고르면 WebRTC 재생으로 돌아가고 재생 막대가
+사라집니다.
+
+웹 페이지는 서버가 만든 HLS 재생 목록을 [hls.js](https://github.com/video-dev/hls.js) 1.7.4로 재생합니다. hls.js 배포
+파일(`hls.min.js`)과 라이선스 파일(Apache License 2.0)은 `web/vendor/hls.js-1.7.4/`에 있고, 서버가 웹 루트의 정적
+파일로 제공하므로 인터넷에 연결되지 않은 네트워크에서도 재생할 수 있습니다. hls.js는 Media Source Extensions가 있는
+브라우저에서만 동작하며, Windows Chrome을 확인 대상으로 합니다.
+
+재생할 수 있는 범위는 다음과 같습니다.
+
+- **닫힌 파일만 재생합니다.** 녹화 스레드가 다 쓰고 디스크와 동기화해 닫은 파일만 재생 목록에 들어갑니다. 지금
+  쓰고 있는 파일은 단위 구간이 끝나 닫힐 때까지 재생할 수 없으므로, 최근 최대 `--record-segment`초(기본 60초)의
+  녹화는 재생되지 않습니다. 카메라를 등록한 뒤 첫 파일이 닫히기 전에는 목록에 "녹화 · <폴더>"가 없습니다.
+- **목록은 연결할 때의 상태입니다.** 서버는 연결 버튼을 누를 때 그 순간의 닫힌 파일로 재생 목록을 만듭니다. 그 뒤에
+  닫힌 파일을 보려면 연결 버튼을 다시 누릅니다. 소스 목록에 새 폴더가 나타나게 하려면 페이지를 새로 엽니다.
+- **꺼졌던 구간은 건너뜁니다.** 카메라가 꺼져 있던 구간은 어느 파일에도 없으므로, 재생은 앞 파일 끝에서 멈추지 않고
+  다음 파일로 바로 이어지며 "녹화 시각"이 다음 파일의 시작 시각으로 바뀝니다.
+- **재생 중 지워진 파일에서 멈춥니다.** 재생하는 동안 보관 분량 삭제나 비상 삭제로 아직 받지 않은 부분의 파일이
+  지워지면, 그 부분을 요청할 때 `404`를 받아 "녹화 재생" 항목에 오류(`networkError fragLoadError` 등)가 표시되고
+  재생이 멈춥니다. 연결 버튼을 다시 누르면 남은 파일로 새 재생 목록을 받습니다. 기본 보관 분량(300초)에서 오래된
+  부분을 보고 있으면 일어날 수 있습니다.
+- **보관 분량이 길면 재생 목록이 커집니다.** 재생 목록에는 녹화 파일의 조각(GOP, vms-cam 기본값으로 약 1초)마다
+  약 110바이트의 세 줄이 들어갑니다. 기본 보관 분량 300초면 폴더 하나의 재생 목록이 약 33KB이고, 최대값
+  604800초(7일)면 약 66MB입니다. 서버는 재생 목록 요청을 받을 때마다 이벤트 루프 스레드에서 이 문자열을 만들므로,
+  보관 분량이 길수록 그동안 다른 요청과 영상 송신이 늦어집니다.
+
+재생에 쓰는 요청은 다음 두 가지입니다. `<폴더>`와 `<파일>` 값은 퍼센트 인코딩합니다(브라우저의
+`encodeURIComponent`).
+
+| 요청 | 응답 |
+|---|---|
+| `GET /api/recordings/playlist.m3u8?camera=<폴더>` | `200`, `Content-Type: application/vnd.apple.mpegurl`, 그 폴더의 닫힌 파일 전체를 시작 시각 순서로 이은 HLS VOD 재생 목록 |
+| `GET /api/recordings/file.mp4?camera=<폴더>&file=<파일>` | 녹화 파일 `<녹화 디렉터리>/<폴더>/<파일>.mp4`를 `Content-Type: video/mp4`로 응답. `Range` 요청은 정적 파일과 같은 규칙입니다 |
+| 매개변수가 없음, 같은 매개변수가 두 번 옴, 퍼센트 인코딩 오류 | `400` |
+| 재생할 녹화가 없는 폴더, 재생 목록에 없는 파일(쓰고 있는 파일, 지운 파일, 없는 이름) | `404` |
+
+`--camera cam=...`으로 녹화하는 서버에서 첫 파일이 닫힌 뒤 다음 명령으로 확인합니다. 소스 목록에 `recording` 원소가
+생깁니다.
 
 ```bash
 curl -s http://localhost:8080/api/sources
 ```
 
 ```json
-{"sources":[{"type":"file","name":"color_bars.h264","frames":300},{"type":"file","name":"test_pattern.h264","frames":300},{"type":"camera","name":"cam"}]}
+{"sources":[{"type":"camera","name":"cam"},{"type":"recording","name":"cam"}]}
+```
+
+재생 목록은 조각 하나를 세그먼트 하나로 하고, 세그먼트를 녹화 파일의 바이트 범위로 가리킵니다. 파일마다
+초기화 구간(`#EXT-X-MAP`)과 파일 시작 시각(`#EXT-X-PROGRAM-DATE-TIME`, UTC)이 있고, 파일이 바뀌는 곳에
+`#EXT-X-DISCONTINUITY`가 있습니다.
+
+```bash
+curl -s 'http://localhost:8080/api/recordings/playlist.m3u8?camera=cam' | head -n 10
+```
+
+```text
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:1
+#EXT-X-MAP:URI="/api/recordings/file.mp4?camera=cam&file=20261108T144333Z",BYTERANGE="665@0"
+#EXT-X-PROGRAM-DATE-TIME:2026-11-08T14:43:33.224Z
+#EXTINF:1.000,
+#EXT-X-BYTERANGE:327156@665
+/api/recordings/file.mp4?camera=cam&file=20261108T144333Z
+```
+
+`#EXT-X-BYTERANGE:<크기>@<시작 위치>`는 녹화 파일의 `<시작 위치>`번째 바이트부터 `<크기>`바이트입니다. 재생기는 이
+값을 `Range` 요청으로 바꿉니다. 위 첫 세그먼트(665번째 바이트부터 327156바이트, 끝 위치 665 + 327156 - 1 = 327820)를
+직접 요청하면 `206`과 그 크기의 본문을 받습니다. 파일 이름은 재생 목록에 나온 값으로 바꿉니다.
+
+```bash
+curl -s -D - -o /dev/null -r 665-327820 'http://localhost:8080/api/recordings/file.mp4?camera=cam&file=20261108T144333Z'
+```
+
+```text
+HTTP/1.1 206 Partial Content
+Content-Type: video/mp4
+Content-Length: 327156
+Connection: close
+Accept-Ranges: bytes
+Content-Range: bytes 665-327820/1809284
+```
+
+서버는 `HEAD` 요청을 지원하지 않으므로(`405`) 응답 헤더는 위처럼 `GET`의 `-D -`로 봅니다. 재생 목록 전체는
+`ffplay`로도 재생할 수 있습니다.
+
+```bash
+ffplay 'http://localhost:8080/api/recordings/playlist.m3u8?camera=cam'
+```
+
+### 소스 목록과 선택 API
+
+웹 페이지는 `GET /api/sources`로 소스 목록을 받고, 고른 소스의 종류(`type`)와 이름(`name`)을 `POST /offer`의
+쿼리 매개변수로 보냅니다. 목록의 `type`은 `file`(동영상 파일), `camera`(카메라), `recording`(카메라 폴더 하나의
+녹화) 중 하나입니다. 목록에는 `file` 원소를 이름순으로 먼저, `camera` 원소를 `--camera`로 등록한 순서대로 그 뒤에,
+`recording` 원소를 폴더 이름순으로 마지막에 둡니다. 카메라는 연결 상태와 관계없이 항상 목록에 있습니다.
+`frames`(프레임 수)는 `file` 원소에만 있습니다. `POST /offer`에 쓸 수 있는 `type`은 `file`과 `camera`이며,
+`recording` 원소의 `name`은 [녹화 재생](#녹화-재생)의 재생 목록 요청에 `camera` 값으로 씁니다.
+
+```bash
+curl -s http://localhost:8080/api/sources
+```
+
+```json
+{"sources":[{"type":"file","name":"color_bars.h264","frames":300},{"type":"file","name":"test_pattern.h264","frames":300},{"type":"camera","name":"cam"},{"type":"recording","name":"cam"}]}
 ```
 
 | `POST /offer` 요청 대상 | 결과 |

@@ -5,13 +5,11 @@
 #include <charconv>
 #include <cstdint>
 #include <format>
-#include <iterator>
 #include <optional>
 #include <print>
 #include <string>
 
 #include "core/ascii.h"
-#include "core/json.h"
 #include "crypto/random.h"
 #include "http/query_string.h"
 #include "webrtc/sdp.h"
@@ -245,34 +243,6 @@ http::HttpEndpointResponse Signaling::HandleOffer(const http::HttpRequest& reque
     return http::HttpEndpointResponse{.status = http::HttpStatus::kOk,
                                       .content_type = "application/sdp",
                                       .body = BuildSdpAnswer(*offer, parameters)};
-}
-
-
-http::HttpEndpointResponse Signaling::HandleSourceList() const {
-    std::string body = R"({"sources":[)";
-    bool is_first = true;
-    const auto append_separator = [&] {
-        if (!is_first) {
-            body.push_back(',');
-        }
-        is_first = false;
-    };
-    for (const media::VideoEntry& entry : video_library_.Entries()) {
-        append_separator();
-        body.append(R"({"type":"file","name":)");
-        core::AppendJsonString(body, entry.name);
-        std::format_to(std::back_inserter(body), R"(,"frames":{}}})", entry.file.Frames().size());
-    }
-    // 카메라는 연결 상태와 관계없이 등록한 순서대로 모두 넣는다.
-    for (const std::unique_ptr<media::CameraEntry>& entry : camera_list_.Entries()) {
-        append_separator();
-        body.append(R"({"type":"camera","name":)");
-        core::AppendJsonString(body, entry->name);
-        body.push_back('}');
-    }
-    body.append("]}");
-    return http::HttpEndpointResponse{
-        .status = http::HttpStatus::kOk, .content_type = "application/json", .body = std::move(body)};
 }
 
 

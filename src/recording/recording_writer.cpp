@@ -10,8 +10,9 @@
 namespace vms::recording {
 
 
-RecordingWriter::RecordingWriter(RecordingOptions options, RecordedFileCatalog closed_files)
-    : options_(options), store_(std::move(options), std::move(closed_files)) {
+RecordingWriter::RecordingWriter(RecordingOptions options, RecordedFileCatalog closed_files,
+                                 RecordingCatalogListener listener)
+    : options_(options), store_(std::move(options), std::move(closed_files), std::move(listener)) {
     // 종료 시그널은 이벤트 루프 스레드가 signalfd로 받는다. 녹화 스레드가 시그널을 받으면 기본 동작으로 프로세스가
     // 끝나므로, 모든 시그널을 막은 상태로 스레드를 만들어 마스크를 물려준 뒤 이 스레드의 마스크를 되돌린다.
     sigset_t all_signals;

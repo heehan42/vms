@@ -32,10 +32,21 @@
         <dt>SRTP 암호 (srtpCipher)</dt>
         <dd id="srtp-cipher">-</dd>
     </dl>
+    <!-- "녹화" 소스를 고르면 WebRTC 대신 hls.js로 재생 목록을 재생한다. 위의 WebRTC 항목은 "-"로 비우고,
+         재생 상태와 복구할 수 없는 오류, 지금 보이는 화면의 녹화 시각(브라우저 지역 시각)을 아래에 표시한다. -->
+    <dl>
+        <dt>녹화 재생</dt>
+        <dd id="recording-status">-</dd>
+        <dt>녹화 시각</dt>
+        <dd id="recording-time">-</dd>
+    </dl>
 
     <h2>영상</h2>
-    <!-- Chrome 자동 재생 정책상 음소거여야 사용자 동작 없이 재생된다. 오디오가 없어도 muted가 필요하다. -->
+    <!-- Chrome 자동 재생 정책상 음소거여야 사용자 동작 없이 재생된다. 오디오가 없어도 muted가 필요하다.
+         재생 막대(controls)는 녹화를 재생하는 동안에만 app.js가 켠다. -->
     <video id="remote-video" autoplay muted playsinline></video>
+    <!-- 녹화 재생에 쓰는 hls.js. 외부 네트워크 없이 재생할 수 있도록 서버가 웹 루트에서 직접 제공한다. -->
+    <script src="vendor/hls.js-1.7.4/hls.min.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
