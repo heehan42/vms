@@ -280,6 +280,52 @@ kill -TERM "${server_pid}"
 wait "${server_pid}"
 server_pid=""
 
+# ICE: 소켓 하나에 announced address 두 개를 지정하면 answer에 두 host candidate가 쓴 순서대로 들어가야 한다.
+"${server_binary}" --port "${port}" --web-root "${web_root}" \
+    --ice-address 127.0.0.1=127.0.0.1,203.0.113.5 --ice-port "${ice_port}" --record-dir "${no_camera_record_dir}" \
+    2>> "${server_log}" &
+server_pid=$!
+for _ in $(seq 50); do
+    if curl -s -o /dev/null "${base_url}/"; then
+        break
+    fi
+    sleep 0.1
+done
+announced_answer="$(post_offer "${sdp_header[@]}")"
+expect_equal "announced address마다의 host candidate" \
+    "a=candidate:1 1 udp 2130706431 127.0.0.1 ${ice_port} typ host
+a=candidate:2 1 udp 2130706175 203.0.113.5 ${ice_port} typ host" \
+    "$(grep '^a=candidate:' <<< "${announced_answer}")"
+expect_equal "announced address를 담은 시작 로그" "1" \
+    "$(grep -c "^ICE 대기 중: udp 127.0.0.1:${ice_port}, candidate 127.0.0.1, 203.0.113.5$" "${server_log}")"
+kill -TERM "${server_pid}"
+wait "${server_pid}"
+server_pid=""
+
+# --ice-address 값 오류는 서버를 띄우기 전에 0이 아닌 코드로 끝나야 한다.
+# expect_startup_failure는 --ice-address 127.0.0.1을 미리 넣으므로, 이 검사는 --ice-address를 직접 넘긴다.
+# $1: 검사 설명, 나머지: 서버에 넘길 추가 인자
+expect_ice_startup_failure() {
+    local description="$1"
+    shift
+    timeout 5 "${server_binary}" --port "${port}" --web-root "${web_root}" \
+        --ice-port "${ice_port}" --record-dir "${no_camera_record_dir}" "$@" 2>> "${server_log}"
+    local exit_code=$?
+    if (( exit_code != 0 && exit_code != 124 )); then
+        expect_equal "${description}" "0이 아님" "0이 아님"
+    else
+        expect_equal "${description}" "0이 아님" "${exit_code}"
+    fi
+}
+
+expect_ice_startup_failure "--ice-address의 빈 announced address" --ice-address 127.0.0.1=
+expect_ice_startup_failure "--ice-address의 IPv4가 아닌 announced address" --ice-address 127.0.0.1=bad
+expect_ice_startup_failure "--ice-address의 bind address 중복" --ice-address 127.0.0.1 --ice-address 127.0.0.1
+expect_ice_startup_failure "--ice-address의 announced address 중복" --ice-address 127.0.0.1=203.0.113.5,203.0.113.5
+expect_equal "bind address 중복 원인 출력" "1" "$(grep -c '같은 bind address를 두 번 지정했습니다: 127.0.0.1' "${server_log}")"
+expect_equal "announced address 중복 원인 출력" "1" \
+    "$(grep -c '같은 announced address가 두 번 나옵니다: 203.0.113.5' "${server_log}")"
+
 # 카메라 인자 오류는 서버를 띄우기 전에 0이 아닌 코드로 끝나야 한다.
 expect_startup_failure "--camera에 = 없음" --camera rtsp://127.0.0.1:8554/cam
 expect_startup_failure "--camera의 빈 이름" --camera =rtsp://127.0.0.1:8554/cam

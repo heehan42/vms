@@ -43,10 +43,11 @@ ICE 연결 확인(STUN)과 DTLS를 UDP 50000 포트에서 받습니다.
 ./build/vms_web_server
 ```
 
-시작 로그에 ICE가 사용하는 주소가 나옵니다. 이 주소가 SDP answer의 candidate로 브라우저에 전달됩니다.
+시작 로그에는 ICE용 UDP 소켓마다 한 줄이 나옵니다. 한 줄에는 소켓의 주소와 포트, 그 소켓의 candidate 주소가 들어 있습니다.
+candidate는 서버가 SDP answer에 적어 브라우저에 알리는 주소입니다. 브라우저는 이 주소로 연결 확인(STUN Binding 요청)을 보냅니다.
 
 ```text
-ICE 대기 중: udp 172.27.209.81:50000
+ICE 대기 중: udp 172.27.209.81:50000, candidate 172.27.209.81
 http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 ```
 
@@ -55,7 +56,7 @@ http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 | `--port` | 8080 | HTTP 포트 |
 | `--web-root` | `./web` | 정적 파일 디렉터리 |
 | `--ice-port` | 50000 | ICE용 UDP 포트 |
-| `--ice-address` | 자동 조회 | candidate로 알리고 UDP 소켓을 바인드할 IPv4 주소. 여러 번 쓸 수 있으며, 쓴 순서대로 우선순위가 높습니다 |
+| `--ice-address` | 자동 조회 | `<bind address>[=<announced address>[,<announced address>]...]` 형식의 ICE 주소. 아래 "ICE 주소 지정" 참고 |
 | `--video-dir` | 없음 | 재생할 H.264 Annex-B 파일(`.h264`, `.264`)이 든 디렉터리. 없으면 연결 확인까지만 하고 영상은 보내지 않습니다 |
 | `--video-fps` | 30 | 영상 재생 속도(1~120). 디렉터리의 모든 파일에 적용하므로 파일을 만들 때의 프레임 속도와 같게 지정합니다 |
 | `--camera` | 없음 | `<이름>=rtsp://<호스트>[:<포트>][/<경로>]` 형식으로 RTSP 카메라를 등록합니다. 여러 번 쓸 수 있으며 쓴 순서가 목록 순서입니다. 아래 "카메라 연결" 참고 |
@@ -65,15 +66,43 @@ http://0.0.0.0:8080/ 에서 대기 중 (웹 루트: /home/.../web)
 | `--record-sync` | 10 | 녹화 파일을 디스크와 동기화하는 주기(초, 1 이상 `--record-segment` 이하) |
 | `--record-min-free` | 1024 | 새 녹화 파일을 열기 전에 확보할 최소 여유 공간(MiB, 0~1048576) |
 
-`--ice-address`를 주지 않으면 켜져 있고 루프백이 아닌 인터페이스의 IPv4 주소를 모두 씁니다.
-이 머신에 없는 주소(예: 공유기의 공인 IP)는 바인드할 수 없으므로 지금은 같은 PC나 같은 내부 네트워크의
-브라우저만 연결할 수 있습니다.
-
 ```bash
 ./build/vms_web_server --port 9000 --web-root /path/to/site --ice-port 50100 --ice-address 127.0.0.1
 ```
 
 `Ctrl+C`로 종료합니다.
+
+### ICE 주소 지정
+
+`--ice-address` 값 하나는 UDP 소켓 하나를 뜻합니다. 값은 두 부분으로 이루어집니다.
+
+- bind address: 서버가 UDP 소켓을 바인드하는 IPv4 주소입니다. 이 머신의 인터페이스에 있는 주소여야 합니다.
+- announced address: 서버가 그 소켓의 candidate로 알리는 IPv4 주소입니다. 이 머신의 인터페이스에 없어도 됩니다.
+  예를 들어 공유기의 public address(인터넷에서 쓰는 공인 IP)를 쓸 수 있습니다.
+
+`=`가 없으면 서버는 bind address를 그대로 알립니다.
+`=` 뒤에 announced address를 쉼표로 나열하면 서버는 bind address를 알리지 않습니다. 그래서 bind address도 알리려면 목록에 직접 넣습니다.
+`--ice-address`는 여러 번 쓸 수 있습니다. candidate의 우선순위는 announced address를 쓴 순서대로 높습니다. 이 순서는 여러 `--ice-address`에 걸쳐 이어집니다.
+
+```bash
+./build/vms_web_server --ice-address 127.0.0.1=127.0.0.1,203.0.113.5
+```
+
+이 명령의 서버는 `127.0.0.1:50000`에 소켓 하나를 엽니다. 그리고 서버는 candidate 두 개를 알립니다.
+
+```text
+ICE 대기 중: udp 127.0.0.1:50000, candidate 127.0.0.1, 203.0.113.5
+```
+
+`--ice-address`를 주지 않으면 서버는 켜져 있고 루프백이 아닌 인터페이스의 IPv4 주소를 모두 bind address로 씁니다.
+이때 서버는 각 주소를 그대로 알립니다.
+
+다음 경우 서버는 원인과 사용법을 출력합니다. 그다음 서버는 종료 코드 1로 끝납니다.
+
+- `=` 뒤에 주소가 없거나, 쉼표 사이가 비어 있습니다.
+- bind address나 announced address가 IPv4 형식이 아닙니다.
+- 같은 bind address를 두 번 지정했습니다.
+- 같은 announced address가 두 번 나옵니다. 여러 `--ice-address`에 걸쳐 검사합니다.
 
 ### 테스트 영상 만들기
 
@@ -393,14 +422,143 @@ Content-Range: bytes 0-9/6746
 
 ## WSL2에서 실행하기
 
-WSL2 기본 네트워크 모드(NAT)에서 확인한 결과 별도 설정 없이 동작합니다.
+WSL2의 네트워크 방식은 두 가지입니다. 방식마다 접속할 수 있는 브라우저가 다릅니다.
 
-- HTTP: Windows 브라우저에서 `http://localhost:8080/`으로 접속합니다(WSL2의 localhost 포워딩).
-- ICE(UDP): localhost 포워딩은 TCP만 전달하지만, Windows는 WSL의 `eth0` 주소(`172.x.x.x`)로 UDP를 직접 보낼 수 있습니다.
-  자동 조회가 이 주소를 candidate로 알리므로 `--ice-address`를 지정할 필요가 없습니다.
+| 방식 | 같은 PC의 Windows 브라우저 | 다른 기기의 브라우저 |
+|---|---|---|
+| NAT mode(기본값) | 접속 가능 | 접속 불가 |
+| mirrored mode | `--ice-address 127.0.0.1`을 더하면 접속 가능 | 접속 가능 |
 
-`eth0` 주소는 WSL을 다시 시작할 때마다 바뀌지만, 서버를 다시 시작하면 새 주소로 조회합니다.
-NAT 모드에서는 같은 PC의 Windows 브라우저만 접속할 수 있고, 다른 기기에서는 WSL에 닿지 않습니다.
+### NAT mode
+
+NAT mode는 WSL2의 기본 네트워크 방식입니다. WSL2는 Windows 안의 가상 네트워크에 있습니다.
+WSL2의 `eth0` 주소는 `172.x.x.x` 같은 주소입니다. NAT mode에서는 별도 설정 없이 서버를 실행합니다.
+
+- HTTP: Windows 브라우저에서 `http://localhost:8080/`으로 접속합니다. WSL2의 localhost 포워딩이 이 TCP 연결을 WSL2로 전달합니다.
+- ICE(UDP): localhost 포워딩은 TCP만 전달합니다. 대신 Windows는 WSL2의 `eth0` 주소로 UDP를 직접 보낼 수 있습니다.
+  `--ice-address`의 자동 조회가 이 주소를 candidate로 알립니다. 그래서 `--ice-address`를 지정할 필요가 없습니다.
+
+`eth0` 주소는 WSL2를 다시 시작할 때마다 바뀝니다. 서버를 다시 시작하면 자동 조회가 새 주소를 찾습니다.
+NAT mode에서는 Windows 밖의 기기가 `eth0` 주소로 패킷을 보낼 수 없습니다. 그래서 다른 기기의 브라우저는 접속할 수 없습니다.
+
+### mirrored mode
+
+mirrored mode에서는 WSL2가 Windows의 네트워크 인터페이스를 함께 씁니다. 그래서 서버는 Windows의 LAN 주소를 bind address로 쓸 수 있습니다.
+다른 기기의 브라우저로 접속하려면 mirrored mode가 필요합니다.
+
+1. `%UserProfile%\.wslconfig`의 `[wsl2]` 절에 다음 줄을 씁니다.
+
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+
+2. PowerShell에서 `wsl --shutdown`을 실행해 WSL2를 다시 시작합니다.
+3. WSL2 셸에서 `wslinfo --networking-mode`를 실행합니다. 결과가 `mirrored`이면 설정이 적용된 것입니다.
+
+mirrored mode에서 Windows가 자기 LAN 주소로 보낸 패킷은 기본 설정에서 WSL2로 전달되지 않습니다.
+그래서 같은 PC의 Windows 브라우저는 LAN 주소 candidate로 서버에 연결할 수 없습니다.
+반면 Windows의 `localhost`로 보낸 TCP와 UDP는 WSL2로 전달됩니다. 그래서 같은 PC의 Windows 브라우저를 위해 `--ice-address 127.0.0.1`을 더합니다.
+
+```bash
+./build/vms_web_server --ice-address 192.168.219.105 --ice-address 127.0.0.1
+```
+
+`192.168.219.105`는 개발 PC의 LAN 주소 예입니다. `ip -4 addr`로 실제 주소를 확인합니다.
+같은 PC의 Windows 브라우저는 `http://localhost:8080/`으로 접속합니다. 같은 Wi-Fi의 기기는 `http://192.168.219.105:8080/`으로 접속합니다.
+다른 기기에서 접속이 되지 않으면 아래 "외부 네트워크에서 접속하기"의 Hyper-V 방화벽 규칙을 먼저 더합니다.
+
+`.wslconfig`의 `[experimental]` 절에 `hostAddressLoopback=true`를 쓰는 방법도 있습니다.
+이 설정은 Windows가 자기 LAN 주소로 보낸 패킷을 WSL2로 전달합니다. 이 설정은 실험 기능이므로 WSL 버전에 따라 동작이 바뀔 수 있습니다.
+이 프로젝트는 이 설정을 시험하지 않았습니다.
+
+## 외부 네트워크에서 접속하기
+
+이 절은 LTE 휴대폰처럼 집 밖의 브라우저가 집의 개발 PC에 접속하는 절차입니다.
+개발 PC는 WSL2를 [mirrored mode](#mirrored-mode)로 실행한다고 가정합니다.
+
+> **경고:** 서버에는 인증과 HTTPS가 없습니다. 공유기에 port forwarding 규칙을 켜면 인터넷의 누구나 실시간 영상과 녹화를 볼 수 있습니다.
+> 그래서 외부 데모를 할 때만 port forwarding 규칙을 켭니다. 데모가 끝나면 규칙을 끕니다.
+
+이 절의 예는 다음 주소를 씁니다.
+
+| 주소 | 예 | 뜻 |
+|---|---|---|
+| LAN 주소 | `192.168.219.105` | 공유기가 개발 PC에 준 private address(내부망에서만 쓰는 주소) |
+| public address | `203.0.113.5` | 통신사가 공유기에 준 공인 IP. `curl -4 ifconfig.me`로 확인합니다 |
+
+### 1. CGNAT 확인
+
+CGNAT는 통신사가 공유기 바깥에 한 번 더 두는 NAT입니다. CGNAT 환경에서는 공유기에 port forwarding 규칙을 넣어도 외부 패킷이 공유기에 도착하지 않습니다.
+그래서 먼저 회선이 CGNAT인지 확인합니다. 확인 방법은 두 가지입니다.
+
+- 공유기 관리 화면의 WAN 주소와 `curl -4 ifconfig.me`의 결과를 비교합니다. 두 주소가 다르면 CGNAT입니다.
+- Windows 명령 프롬프트에서 `tracert -d 8.8.8.8`을 실행합니다. 두 번째 hop의 주소가 `100.64.0.0/10` 범위이면 CGNAT입니다.
+
+CGNAT이면 이 절차로는 외부에서 접속할 수 없습니다.
+
+### 2. Hyper-V 방화벽 규칙
+
+Hyper-V 방화벽은 WSL2로 들어오는 연결을 거르는 Windows 방화벽입니다. 관리자 권한 PowerShell에서 HTTP 포트와 ICE 포트의 규칙을 더합니다.
+`{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}`은 Microsoft가 공개한 WSL의 VM 식별자입니다.
+
+```powershell
+New-NetFirewallHyperVRule -Name "vms-http" -DisplayName "vms HTTP" -Direction Inbound -VMCreatorId "{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}" -Protocol TCP -LocalPorts 8080
+New-NetFirewallHyperVRule -Name "vms-ice" -DisplayName "vms ICE" -Direction Inbound -VMCreatorId "{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}" -Protocol UDP -LocalPorts 50000
+```
+
+이 규칙은 출발지와 관계없이 두 포트의 연결을 허용합니다. 외부 기기의 접근은 공유기의 port forwarding 규칙이 정합니다.
+
+### 3. 공유기 설정
+
+공유기 관리 화면에서 두 가지를 설정합니다.
+
+1. DHCP 고정 할당: 개발 PC의 MAC 주소에 LAN 주소 `192.168.219.105`를 지정합니다.
+   그러면 port forwarding 규칙과 `--ice-address`의 LAN 주소가 계속 맞습니다.
+2. port forwarding 규칙: 다음 두 규칙을 더합니다. TCP 규칙은 UDP 패킷에 적용되지 않으므로 두 규칙이 모두 필요합니다.
+
+   | 프로토콜 | 외부 포트 | 내부 주소 | 내부 포트 |
+   |---|---|---|---|
+   | TCP | 8080 | `192.168.219.105` | 8080 |
+   | UDP | 50000 | `192.168.219.105` | 50000 |
+
+### 4. 서버 실행
+
+```bash
+./build/vms_web_server --ice-address 192.168.219.105=192.168.219.105,203.0.113.5 --ice-address 127.0.0.1
+```
+
+이 명령의 서버는 [bind address](#ice-주소-지정)마다 UDP 소켓을 하나씩, 모두 두 개 엽니다. 그리고 서버는 candidate 세 개를 이 순서로 알립니다.
+
+1. `192.168.219.105`: 같은 Wi-Fi의 기기가 연결합니다.
+2. `203.0.113.5`: 외부 기기가 연결합니다. 공유기는 이 주소로 온 패킷을 `192.168.219.105:50000`의 소켓으로 전달합니다.
+3. `127.0.0.1`: 같은 PC의 Windows 브라우저가 연결합니다.
+
+LAN 주소를 public address보다 앞에 둡니다. 일부 공유기는 내부 기기가 public address로 보낸 패킷을 내부로 되돌려 보내지 않습니다(NAT hairpinning 미지원).
+그래도 같은 Wi-Fi의 기기는 앞의 LAN 주소 candidate로 연결합니다.
+
+시작 로그는 다음과 같습니다.
+
+```text
+ICE 대기 중: udp 192.168.219.105:50000, candidate 192.168.219.105, 203.0.113.5
+ICE 대기 중: udp 127.0.0.1:50000, candidate 127.0.0.1
+```
+
+외부 브라우저에는 LAN 주소와 `127.0.0.1` candidate도 전달됩니다. 외부 브라우저는 이 주소로 연결하지 못하고 public address로 연결합니다.
+LAN 주소를 외부에 알리고 싶지 않으면 public address만 [announced address](#ice-주소-지정)로 지정합니다.
+
+### 5. 외부 브라우저에서 접속
+
+외부 브라우저에서 `http://203.0.113.5:8080/`으로 접속합니다.
+연결되면 서버 로그의 `ICE 연결됨` 줄에 휴대폰의 통신사 쪽 주소가 남습니다.
+
+### public address가 바뀌었을 때
+
+가정용 public address는 공유기를 다시 켜거나 시간이 오래 지나면 바뀔 수 있습니다.
+public address가 바뀌어도 새 주소로 웹 페이지는 열립니다. 하지만 answer의 candidate는 예전 주소를 가리킵니다. 그래서 WebRTC 연결만 실패합니다.
+
+이 증상이 보이면 `curl -4 ifconfig.me`의 결과를 시작 로그의 candidate 주소와 비교합니다.
+두 주소가 다르면 새 주소를 `--ice-address`에 넣어 서버를 다시 실행합니다.
 
 ## 연결 확인
 

@@ -1,5 +1,6 @@
 add_unit_test(stun_message_test)
 add_unit_test(ice_lite_agent_test)
+add_unit_test(ice_listen_address_test)
 add_unit_test(rtp_packet_test)
 add_unit_test(rtcp_packet_test)
 add_unit_test(h264_packetizer_test)

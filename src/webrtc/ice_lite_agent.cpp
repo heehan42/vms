@@ -205,10 +205,10 @@ std::string DescribeRtcpCompound(const std::vector<RtcpPacket>& packets) {
 
 // RFC 8445 공식으로 host candidate의 우선순위를 계산한다.
 //
-// address_index: 설정 주소 목록에서의 순번. 앞선 주소일수록 우선순위가 높다.
+// candidate_index: 전체 announced address 목록에서의 순번. 앞선 주소일수록 우선순위가 높다.
 // 반환값: 2^24 * 종류 선호도 + 2^8 * 로컬 선호도 + (256 - component ID)
-std::uint32_t ComputeHostPriority(std::size_t address_index) {
-    const auto local_preference = static_cast<std::uint32_t>(65535 - address_index);
+std::uint32_t ComputeHostPriority(std::size_t candidate_index) {
+    const auto local_preference = static_cast<std::uint32_t>(65535 - candidate_index);
     return (kHostTypePreference << 24) | (local_preference << 8) | (256 - kRtpComponentId);
 }
 
@@ -268,14 +268,20 @@ std::expected<std::unique_ptr<IceLiteAgent>, std::string> IceLiteAgent::Start(
     if (config.addresses.empty()) {
         return std::unexpected("ICE 주소가 하나도 없습니다");
     }
+    for (const IceListenAddress& listen_address : config.addresses) {
+        if (listen_address.announced_addresses.empty()) {
+            return std::unexpected(std::format("announced address가 하나도 없습니다 (bind address {})",
+                                               core::FormatIpv4Address(listen_address.bind_address)));
+        }
+    }
 
     std::vector<BoundSocket> sockets;
-    for (const in_addr& address : config.addresses) {
+    for (const IceListenAddress& listen_address : config.addresses) {
         BoundSocket bound;
-        auto socket = OpenUdpSocket(address, config.port, bound.local_endpoint);
+        auto socket = OpenUdpSocket(listen_address.bind_address, config.port, bound.local_endpoint);
         if (!socket) {
             return std::unexpected(std::format("UDP 소켓 바인드 실패 ({}:{}): {}",
-                                               core::FormatIpv4Address(address), config.port,
+                                               core::FormatIpv4Address(listen_address.bind_address), config.port,
                                                socket.error().message()));
         }
         bound.socket = *std::move(socket);
@@ -308,14 +314,20 @@ IceLiteAgent::IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> socke
       video_fps_(config.video_fps),
       camera_wait_timeout_(config.camera_wait_timeout),
       sockets_(std::move(sockets)) {
-    for (std::size_t index = 0; index < sockets_.size(); ++index) {
-        const sockaddr_in& endpoint = sockets_[index].local_endpoint;
-        candidates_.push_back(IceCandidate{
-            .foundation = static_cast<std::uint32_t>(index + 1),
-            .priority = ComputeHostPriority(index),
-            .address = core::FormatIpv4Address(endpoint.sin_addr),
-            .port = ntohs(endpoint.sin_port),
-        });
+    // candidate 순번은 소켓마다 새로 세지 않고 전체 announced address 목록에서 이어 센다. 그래서 명령행에 쓴 순서가
+    // 그대로 priority 순서가 되고, 같은 소켓의 candidate도 foundation이 서로 다르다.
+    std::size_t candidate_index = 0;
+    for (std::size_t socket_index = 0; socket_index < sockets_.size(); ++socket_index) {
+        const std::uint16_t port = ntohs(sockets_[socket_index].local_endpoint.sin_port);
+        for (const in_addr& announced_address : config.addresses[socket_index].announced_addresses) {
+            candidates_.push_back(IceCandidate{
+                .foundation = static_cast<std::uint32_t>(candidate_index + 1),
+                .priority = ComputeHostPriority(candidate_index),
+                .address = core::FormatIpv4Address(announced_address),
+                .port = port,
+            });
+            ++candidate_index;
+        }
     }
 }
 

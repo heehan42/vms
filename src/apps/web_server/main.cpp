@@ -38,6 +38,7 @@
 #include "rtsp/rtsp_url.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_lite_agent.h"
+#include "webrtc/ice_listen_address.h"
 #include "webrtc/signaling.h"
 
 namespace fs = std::filesystem;
@@ -62,9 +63,12 @@ using vms::recording::RecordingWriter;
 using vms::rtsp::RtspCameraClient;
 using vms::rtsp::RtspCameraClientConfig;
 using vms::rtsp::RtspUrl;
+using vms::webrtc::CheckIceListenAddresses;
 using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
+using vms::webrtc::IceListenAddress;
+using vms::webrtc::ParseIceListenAddress;
 using vms::webrtc::Signaling;
 
 
@@ -74,7 +78,8 @@ namespace {
 // 명령행 사용법
 constexpr std::string_view kUsage =
     "사용법: vms_web_server [--port <1-65535>] [--web-root <디렉터리>]\n"
-    "                      [--ice-port <1-65535>] [--ice-address <IPv4 주소>]...\n"
+    "                      [--ice-port <1-65535>]\n"
+    "                      [--ice-address <bind address>[=<announced address>[,<announced address>]...]]...\n"
     "                      [--video-dir <H.264 Annex-B 파일 디렉터리>] [--video-fps <1-120>]\n"
     "                      [--camera <이름>=rtsp://<호스트>[:<포트>][/<경로>]]...\n"
     "                      [--record-dir <녹화 디렉터리>] [--record-segment <10-3600초>]\n"
@@ -131,8 +136,9 @@ struct ServerOptions {
     std::uint16_t ice_port = 50000;
 
 
-    // --ice-address로 지정한 주소. 비어 있으면 인터페이스 주소를 자동으로 조회한다.
-    std::vector<in_addr> ice_addresses;
+    // --ice-address로 지정한 bind address와 announced address. 명령행에 쓴 순서다. 비어 있으면 인터페이스 주소를
+    // 자동으로 조회한다.
+    std::vector<IceListenAddress> ice_addresses;
 
 
     // --video-dir로 지정한 동영상 디렉터리. 비어 있으면 동영상 없이 실행하며 미디어를 보내지 않는다.
@@ -328,9 +334,12 @@ std::expected<CameraOption, std::string> ParseCameraOption(std::string_view valu
 //   - 서버 설정: 생략한 항목은 기본값(포트 8080, 웹 루트 ./web, ICE 포트 50000, ICE 주소 자동,
 //     동영상 없음, 30fps, 카메라 없음, 녹화 디렉터리 recordings, 단위 60초, 보관 300초, 동기화 10초,
 //     최소 여유 공간 1024MiB)이다.
-//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·IPv4 주소·재생 속도·카메라·녹화 인자
+//   - 오류 메시지: 알 수 없는 인자, 값이 없는 옵션, 잘못된 포트·ICE 주소·재생 속도·카메라·녹화 인자,
+//     bind address나 announced address의 중복
 //
-// --ice-address는 여러 번 쓸 수 있으며, 쓴 순서가 candidate 우선순위 순서가 된다. --camera도 여러 번 쓸 수 있으며,
+// --ice-address 값의 형식은 `<bind address>[=<announced address>[,<announced address>]...]`이다. `=`가 없으면
+// bind address를 그대로 알린다. --ice-address는 여러 번 쓸 수 있으며, announced address를 쓴 순서가 여러 값에
+// 걸쳐 candidate 우선순위 순서가 된다. --camera도 여러 번 쓸 수 있으며,
 // 쓴 순서가 카메라 목록 순서가 된다. 카메라 호스트 이름은 여기서 해석하지 않는다.
 std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const> arguments) {
     ServerOptions options;
@@ -375,12 +384,15 @@ std::expected<ServerOptions, std::string> ParseCommandLine(std::span<char* const
             }
             options.video_fps = *fps;
         } else {
-            const auto address = vms::core::ParseIpv4Address(value);
-            if (!address) {
-                return std::unexpected(std::format("잘못된 IPv4 주소: {}", value));
+            auto ice_address = ParseIceListenAddress(value);
+            if (!ice_address) {
+                return std::unexpected(std::format("잘못된 --ice-address 값 ({}): {}", value, ice_address.error()));
             }
-            options.ice_addresses.push_back(*address);
+            options.ice_addresses.push_back(*std::move(ice_address));
         }
+    }
+    if (auto checked = CheckIceListenAddresses(options.ice_addresses); !checked) {
+        return std::unexpected(checked.error());
     }
     if (auto checked = CheckRecordingOptions(options.recording); !checked) {
         return std::unexpected(checked.error());
@@ -413,9 +425,10 @@ std::expected<fs::path, std::string> ResolveWebRoot(const fs::path& web_root) {
 // ICE 주소를 정한다. 지정한 주소가 있으면 그대로 쓰고, 없으면 인터페이스 주소를 조회한다.
 //
 // specified: --ice-address로 지정한 주소
-// 반환값: 사용할 주소 목록. 조회에 실패하거나 사용할 주소가 하나도 없으면 오류 메시지
-std::expected<std::vector<in_addr>, std::string> ResolveIceAddresses(
-    std::vector<in_addr> specified) {
+// 반환값: 사용할 주소 목록. 조회한 주소는 bind address이자 하나뿐인 announced address가 된다.
+//   조회에 실패하거나 사용할 주소가 하나도 없으면 오류 메시지
+std::expected<std::vector<IceListenAddress>, std::string> ResolveIceAddresses(
+    std::vector<IceListenAddress> specified) {
     if (!specified.empty()) {
         return specified;
     }
@@ -427,7 +440,12 @@ std::expected<std::vector<in_addr>, std::string> ResolveIceAddresses(
     if (addresses->empty()) {
         return std::unexpected("루프백이 아닌 IPv4 주소가 없습니다. --ice-address로 지정하세요");
     }
-    return *std::move(addresses);
+
+    std::vector<IceListenAddress> listen_addresses;
+    for (const in_addr& address : *addresses) {
+        listen_addresses.push_back(IceListenAddress{.bind_address = address, .announced_addresses = {address}});
+    }
+    return listen_addresses;
 }
 
 
@@ -659,7 +677,7 @@ int main(int argc, char* argv[]) {
     }
 
     auto ice_agent = IceLiteAgent::Start(event_loop,
-                                         IceLiteAgentConfig{.addresses = *std::move(ice_addresses),
+                                         IceLiteAgentConfig{.addresses = *ice_addresses,
                                                             .port = options->ice_port,
                                                             .video_fps = options->video_fps},
                                          *dtls_context);
@@ -667,8 +685,16 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "ICE 시작 실패: {}", ice_agent.error());
         return 1;
     }
-    for (const auto& candidate : (*ice_agent)->Candidates()) {
-        std::println(stderr, "ICE 대기 중: udp {}:{}", candidate.address, candidate.port);
+    // candidate 목록에는 bind address가 없다. 그래서 설정에서 소켓마다 한 줄씩 만든다. 이 줄에는 announced address도
+    // 남긴다. 그러면 public address가 바뀌었을 때 사용자가 로그의 주소와 실제 주소를 비교할 수 있다.
+    for (const IceListenAddress& ice_address : *ice_addresses) {
+        std::string announced;
+        for (const in_addr& announced_address : ice_address.announced_addresses) {
+            announced += announced.empty() ? "" : ", ";
+            announced += vms::core::FormatIpv4Address(announced_address);
+        }
+        std::println(stderr, "ICE 대기 중: udp {}:{}, candidate {}", vms::core::FormatIpv4Address(ice_address.bind_address),
+                     options->ice_port, announced);
     }
 
     // 웹 서버의 /offer 핸들러가 같은 프로세스의 ICE-lite 에이전트를 직접 호출한다.

@@ -29,6 +29,7 @@ using vms::test::Expect;
 using vms::webrtc::DtlsTransport;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
+using vms::webrtc::IceListenAddress;
 using vms::webrtc::Signaling;
 
 namespace fs = std::filesystem;
@@ -170,7 +171,8 @@ int main() {
     cameras.Add("a.h264", "rtsp://127.0.0.1:9554/cam");
 
     const in_addr loopback = *vms::core::ParseIpv4Address("127.0.0.1");
-    auto agent = IceLiteAgent::Start(*loop, IceLiteAgentConfig{.addresses = {loopback}, .port = 0}, *dtls_context);
+    const IceListenAddress loopback_listen_address{.bind_address = loopback, .announced_addresses = {loopback}};
+    auto agent = IceLiteAgent::Start(*loop, IceLiteAgentConfig{.addresses = {loopback_listen_address}, .port = 0}, *dtls_context);
     if (!agent) {
         Expect(false, "에이전트 시작: " + agent.error());
         return vms::test::ExitCode();

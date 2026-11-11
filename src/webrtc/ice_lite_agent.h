@@ -24,6 +24,7 @@
 #include "media/live_video_source.h"
 #include "webrtc/dtls_transport.h"
 #include "webrtc/ice_candidate.h"
+#include "webrtc/ice_listen_address.h"
 #include "webrtc/live_video_stream_sender.h"
 #include "webrtc/rtcp_packet.h"
 #include "webrtc/video_stream_sender.h"
@@ -34,8 +35,11 @@ namespace vms::webrtc {
 
 // ICE-lite 에이전트 실행 설정.
 struct IceLiteAgentConfig {
-    // UDP 소켓을 바인드하고 candidate로 알릴 IPv4 주소. 우선순위가 높은 것부터 나열한다.
-    std::vector<in_addr> addresses;
+    // 소켓 구성과 candidate 구성. 소켓은 bind address마다 하나 열고, candidate는 announced address마다 하나 만든다.
+    //
+    // 하나 이상이어야 하며, 항목마다 announced_addresses가 비어 있으면 안 된다. candidate의 priority는 목록 순서와
+    // 각 항목의 announced address 순서를 이어서 센 순번대로 높다.
+    std::vector<IceListenAddress> addresses;
 
 
     // 모든 주소에 공통으로 쓸 UDP 포트. 0이면 주소마다 커널이 고른 포트를 쓴다(테스트용).
@@ -166,7 +170,7 @@ struct RtcpReceiveStats {
 //
 // 서버는 ICE-lite이므로 항상 controlled 역할이다. 브라우저가 보낸 연결 확인 요청에 응답하고
 // 브라우저의 nomination을 받아들이기만 하며, 먼저 요청을 보내지 않는다.
-// 설정한 주소마다 UDP 소켓 하나를 소유하고, 모든 세션이 이 소켓들을 함께 쓴다. 응답은 요청이 도착한
+// 설정한 bind address마다 UDP 소켓 하나를 소유하고, 모든 세션이 이 소켓들을 함께 쓴다. 응답은 요청이 도착한
 // 소켓에서 보내 출발 주소가 요청의 목적지와 같게 한다.
 // 세션마다 DTLS 재전송 타이머와 만료 타이머를 루프에 건다. 파일 동영상이 지정된 세션은 DTLS가 완료되면
 // VideoStreamSender를 만들고 프레임 타이머로 nominated pair에 SRTP 패킷을 보낸다. 카메라가 지정된 세션은 DTLS가
@@ -176,14 +180,15 @@ struct RtcpReceiveStats {
 // 연결된 EventLoop와 DtlsContext보다 먼저 소멸해야 한다.
 class IceLiteAgent {
 public:
-    // 주소마다 UDP 소켓을 열어 루프에 등록하고 패킷을 받기 시작한다.
+    // bind address마다 UDP 소켓을 열어 루프에 등록하고 패킷을 받기 시작한다.
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프. 반환된 에이전트보다 오래 살아 있어야 한다.
-    // config: 주소 목록, 포트, 세션 만료 시간, 재생 속도. 주소가 하나 이상이어야 한다.
+    // config: 주소 목록, 포트, 세션 만료 시간, 재생 속도. 주소가 하나 이상이어야 하고, 항목마다 announced address가
+    //   하나 이상이어야 한다.
     // dtls_context: 세션마다 DtlsTransport를 만들 컨텍스트. 참조만 하므로 반환된 에이전트보다 오래
     //   살아 있어야 한다.
-    // 반환값: 시작된 에이전트. 주소가 없거나, 어느 한 주소라도 소켓 생성·바인드·등록에 실패하면
-    //   실패한 주소와 원인을 담은 오류 메시지
+    // 반환값: 시작된 에이전트. 주소가 없거나, announced address가 빈 항목이 있거나, 어느 한 bind address라도
+    //   소켓 생성·바인드·등록에 실패하면 실패한 주소와 원인을 담은 오류 메시지
     static std::expected<std::unique_ptr<IceLiteAgent>, std::string> Start(
         core::EventLoop& loop, IceLiteAgentConfig config, const crypto::DtlsContext& dtls_context);
 
@@ -214,7 +219,8 @@ public:
 
     // answer에 넣을 host candidate 목록을 돌려준다.
     //
-    // 반환값: 설정 순서대로의 candidate. 실제로 바인드한 포트를 담으며, 이 객체가 살아 있는 동안 유효하다.
+    // 반환값: announced address마다 하나인 candidate. 설정 순서대로이며, 각 candidate의 포트는 그 announced address가
+    //   속한 소켓이 실제로 바인드한 포트다. 이 객체가 살아 있는 동안 유효하다.
     const std::vector<IceCandidate>& Candidates() const { return candidates_; }
 
 
@@ -396,7 +402,8 @@ private:
     //
     // loop: 소켓과 타이머를 등록할 이벤트 루프
     // sockets: 소유권을 넘겨받을 소켓 목록
-    // config: 세션 만료 시간과 재생 속도. 주소와 포트는 쓰지 않는다.
+    // config: announced address 목록, 세션 만료 시간, 재생 속도. addresses는 sockets와 같은 순서여야 한다.
+    //   포트는 쓰지 않는다.
     // dtls_context: DtlsTransport를 만들 컨텍스트
     IceLiteAgent(core::EventLoop& loop, std::vector<BoundSocket> sockets, const IceLiteAgentConfig& config,
                  const crypto::DtlsContext& dtls_context);
@@ -629,11 +636,12 @@ private:
     std::chrono::milliseconds camera_wait_timeout_;
 
 
-    // 주소별 UDP 소켓. 설정 주소 순서이며 candidates_와 같은 위치끼리 대응한다.
+    // bind address별 UDP 소켓. 설정 순서다.
     std::vector<BoundSocket> sockets_;
 
 
-    // answer에 넣을 host candidate. sockets_와 같은 순서다.
+    // answer에 넣을 host candidate. announced address마다 하나이며 설정 순서다. 한 소켓에 여러 candidate가 대응할 수
+    // 있다. 패킷은 announced address와 관계없이 bind address의 소켓에 도착하므로 연결 경로는 소켓 순번으로 식별한다.
     std::vector<IceCandidate> candidates_;
 
 

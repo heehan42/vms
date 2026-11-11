@@ -51,6 +51,7 @@ using vms::webrtc::DtlsTransport;
 using vms::webrtc::BuildBindingRequest;
 using vms::webrtc::IceLiteAgent;
 using vms::webrtc::IceLiteAgentConfig;
+using vms::webrtc::IceListenAddress;
 using vms::webrtc::IceSessionParameters;
 using vms::webrtc::IceSessionRequest;
 using vms::webrtc::IceSessionState;
@@ -199,6 +200,15 @@ H264File MakeOtherSyntheticH264File() {
 }
 
 
+// 127.0.0.1에 바인드하고 127.0.0.1만 알리는 설정 항목을 만든다.
+//
+// 반환값: bind address와 announced address가 모두 127.0.0.1인 항목
+IceListenAddress LoopbackListenAddress() {
+    const in_addr loopback = *vms::core::ParseIpv4Address("127.0.0.1");
+    return IceListenAddress{.bind_address = loopback, .announced_addresses = {loopback}};
+}
+
+
 // 에이전트의 첫 candidate를 소켓 주소로 바꾼다.
 //
 // agent: 시작한 에이전트
@@ -288,6 +298,52 @@ void TestIgnoresInvalidPackets(EventLoop& loop, IceLiteAgent& agent) {
     const auto valid = BuildBindingRequest(transaction_id, credentials->ice_ufrag + ":brow",
                                            credentials->ice_pwd, false);
     Expect(Exchange(loop, client, server, *valid).has_value(), "잘못된 패킷 뒤에도 정상 응답");
+}
+
+
+// 소켓 하나에 announced address가 둘이면 candidate를 둘 만들고, 소켓은 그대로 요청에 응답하는지 검사한다.
+void TestAnnouncesMultipleAddressesPerSocket(EventLoop& loop, const DtlsContext& dtls_context) {
+    IceListenAddress listen_address = LoopbackListenAddress();
+    listen_address.announced_addresses.push_back(*vms::core::ParseIpv4Address("203.0.113.5"));
+    auto agent = IceLiteAgent::Start(loop, IceLiteAgentConfig{.addresses = {listen_address}, .port = 0},
+                                     dtls_context);
+    if (!agent) {
+        Expect(false, "announced address가 둘인 에이전트 시작: " + agent.error());
+        return;
+    }
+
+    const auto& candidates = (*agent)->Candidates();
+    if (candidates.size() != 2) {
+        Expect(false, "announced address마다 candidate 하나");
+        return;
+    }
+    Expect(candidates[0].address == "127.0.0.1" && candidates[1].address == "203.0.113.5",
+           "candidate 주소가 announced address 순서");
+    Expect(candidates[0].port != 0 && candidates[0].port == candidates[1].port, "두 candidate의 포트가 같은 소켓의 포트");
+    Expect(candidates[0].priority == 2130706431u && candidates[1].priority == 2130706175u,
+           "announced address 순서대로 높은 priority");
+    Expect(candidates[0].foundation != candidates[1].foundation, "candidate마다 다른 foundation");
+
+    // 공유기가 public address로 온 요청을 bind address로 바꿔 전달한 경우와 같이, 요청은 bind address의 소켓에 도착한다.
+    const auto credentials = CreateTestSession(**agent, kTestRemoteFingerprint);
+    const TestClient client = OpenClient();
+    if (!credentials || !client.socket.IsValid()) {
+        Expect(false, "세션과 클라이언트 준비");
+        return;
+    }
+    const auto request = BuildBindingRequest({8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8},
+                                             credentials->ice_ufrag + ":brow", credentials->ice_pwd, false);
+    Expect(Exchange(loop, client, ServerEndpoint(**agent), *request).has_value(),
+           "announced address가 둘인 소켓의 Binding 요청에 응답");
+}
+
+
+// announced address가 빈 설정 항목이 있으면 시작하지 않는지 검사한다.
+void TestRejectsEmptyAnnouncedAddresses(EventLoop& loop, const DtlsContext& dtls_context) {
+    const IceListenAddress listen_address{.bind_address = *vms::core::ParseIpv4Address("127.0.0.1"),
+                                          .announced_addresses = {}};
+    Expect(!IceLiteAgent::Start(loop, IceLiteAgentConfig{.addresses = {listen_address}, .port = 0}, dtls_context),
+           "announced address가 없으면 시작 실패");
 }
 
 
@@ -1009,7 +1065,7 @@ constexpr std::chrono::milliseconds kShortCameraWaitTimeout = 300ms;
 // 세션이 카메라 소스를 구독하므로, 소스를 먼저 만들고 에이전트를 나중에 만들어 먼저 소멸하게 한다.
 std::unique_ptr<IceLiteAgent> StartCameraAgent(EventLoop& loop, const DtlsContext& dtls_context) {
     auto agent = IceLiteAgent::Start(loop,
-                                     IceLiteAgentConfig{.addresses = {*vms::core::ParseIpv4Address("127.0.0.1")},
+                                     IceLiteAgentConfig{.addresses = {LoopbackListenAddress()},
                                                         .port = 0,
                                                         .camera_wait_timeout = kShortCameraWaitTimeout},
                                      dtls_context);
@@ -1186,7 +1242,7 @@ int main() {
         return vms::test::ExitCode();
     }
 
-    const in_addr loopback = *vms::core::ParseIpv4Address("127.0.0.1");
+    const IceListenAddress loopback = LoopbackListenAddress();
     auto agent = IceLiteAgent::Start(*loop, IceLiteAgentConfig{.addresses = {loopback}, .port = 0},
                                      *dtls_context);
     if (!agent) {
@@ -1200,6 +1256,8 @@ int main() {
     TestRespondsAndRecordsNomination(*loop, **agent);
     TestIgnoresInvalidPackets(*loop, **agent);
     TestCreatesDistinctSessionsAndRejectsEmptyConfig(*loop, **agent, *dtls_context);
+    TestAnnouncesMultipleAddressesPerSocket(*loop, *dtls_context);
+    TestRejectsEmptyAnnouncedAddresses(*loop, *dtls_context);
     TestCompletesDtlsHandshakeOverUdp(*loop, **agent, *certificate);
     TestKeepsFirstNominatedPairForDtls(*loop, **agent);
     TestNoMediaWithoutVideo(*loop, **agent);
